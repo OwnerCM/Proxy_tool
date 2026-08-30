@@ -28,8 +28,7 @@ services:
         max-file: '2'
 
   proxy-tool:
-    image: ghcr.io/OWNER/proxy-tool:latest
-    build: .
+    image: ghcr.io/ownercm/proxy-tool:latest
     container_name: proxy-tool
     restart: unless-stopped
     ports:
