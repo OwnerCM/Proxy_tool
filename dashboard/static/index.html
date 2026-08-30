@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>代理池</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <h1 id="title" style="cursor:pointer">🌐 代理池</h1>
+    <span id="stats-bar"></span>
+  </div>
+  <div id="view-country-list">
+    <div id="search-box">
+      <input type="text" id="country-search" placeholder="搜索国家..." oninput="filterCountries()">
+    </div>
+    <div id="country-grid"></div>
+  </div>
+  <div id="view-country-detail" style="display:none">
+    <div id="detail-header">
+      <button id="btn-back" onclick="goBack()">← 返回</button>
+      <h2 id="detail-title"></h2>
+    </div>
+    <div id="detail-filters">
+      <select id="f-proto" onchange="loadDetail(1)"><option value="">全部协议</option></select>
+      <input type="text" id="f-location" placeholder="城市筛选..." oninput="debounceLoad()">
+      <input type="number" id="f-delay" placeholder="最大延迟(ms)" oninput="debounceLoad()">
+      <select id="f-sort" onchange="loadDetail(1)">
+        <option value="delay-asc">延迟 ↑</option>
+        <option value="delay-desc">延迟 ↓</option>
+      </select>
+      <input type="text" id="f-search" placeholder="搜索IP..." oninput="debounceLoad()">
+    </div>
+    <div id="detail-info"></div>
+    <div id="detail-table-wrap">
+      <table id="detail-table">
+        <thead><tr><th>IP:端口</th><th>协议</th><th>延迟</th><th>城市</th><th>最后检测</th></tr></thead>
+        <tbody id="detail-tbody"></tbody>
+      </table>
+    </div>
+    <div id="detail-pager"></div>
+    <div style="text-align:center;margin:10px;color:#888">
+      <small>点击 IP:端口 复制代理地址</small>
+    </div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

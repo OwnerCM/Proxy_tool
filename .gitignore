@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyc.*
+*.egg-info/
+.tox/
+.coverage
+.pytest_cache/
+htmlcov/
+
+# ---- IDE / editor ----
+.idea/
+.vscode/
+.claude/
+.DS_Store
+
+# ---- 运行时产物 ----
+*.log
+log/
+*.pid
+proxy_pool.pid
+site/
+
+# ---- 本地环境变量（.env.example 需要入库） ----
+.env
+!.env.example
+
+# ---- 文档草稿 ----
+docs/ideas/
+docs/specs/
+
+# 注意：dashboard/data/ 下的离线 GeoIP 库（ipdb.bin、ip2region.xdb）
+# 是运行必需的资源，必须入库，不要忽略。
