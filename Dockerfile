@@ -59,14 +59,11 @@ RUN pip install -r requirements.txt -r requirements-dashboard.txt
 # ══════════ runtime ══════════
 FROM python:3.10-slim-bookworm
 
-ARG VCS_REF=unknown
-ARG BUILD_VERSION=dev
-
+# 只保留本地构建时有意义的标签。revision / version / source 这几个由 CI 里的
+# docker/metadata-action 自动注入（且会覆盖这里的同名值），不用在这儿重复维护。
 LABEL org.opencontainers.image.title="proxy-tool" \
       org.opencontainers.image.description="代理池 + 可视化看板 + 轮换代理网关，单容器多架构镜像（支持 arm64）" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.version="${BUILD_VERSION}"
+      org.opencontainers.image.licenses="MIT"
 
 # tini -> PID 1，负责信号转发与回收孤儿进程
 # curl -> HEALTHCHECK
