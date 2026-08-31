@@ -2,9 +2,12 @@ name: proxy-tool
 
 # 两个容器：Redis 一个，proxy_pool + 展示层 + 网关合并成的应用一个。
 #
-#   本地构建启动：  docker compose up -d --build
-#   用已发布镜像：  docker compose pull && docker compose up -d
-#                  （需要先把下面 image 里的 OWNER 换成你的 GitHub 用户名）
+#   docker compose pull && docker compose up -d
+#
+# 这里刻意只写 image、不写 build —— 纯部署用，up 时只会拉镜像，
+# 不会在拉不到时悄悄改成本地构建。
+# 改了代码想在本地验证，显式构建成同名镜像即可：
+#   docker build -t ghcr.io/ownercm/proxy-tool:latest .
 #
 # 端口：5010 proxy_pool 原生 API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
 #
@@ -28,8 +31,7 @@ services:
         max-file: '2'
 
   proxy-tool:
-    image: ghcr.io/OWNER/proxy-tool:latest
-    build: .
+    image: ghcr.io/ownercm/proxy-tool:latest
     container_name: proxy-tool
     restart: unless-stopped
     ports:

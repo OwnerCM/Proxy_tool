@@ -55,11 +55,19 @@ push/tag ───►│                                   ├─► imagetools 
 
 ```bash
 git clone <你的仓库地址> && cd Proxy_tool
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
-要用 CI 产出的镜像，先把 `docker-compose.yml` 里的 `OWNER` 换成你的 GitHub 用户名，
-然后 `docker compose pull && docker compose up -d`。
+`docker-compose.yml` 里只写了 `image` 没写 `build`，是纯部署用的 —— `up` 只会拉镜像，
+不会在拉不到时悄悄改成本地构建。镜像地址写死为 `ghcr.io/ownercm/proxy-tool:latest`，
+换人用的话改这一行。
+
+改了代码想在本地验证，显式构建成同名镜像再起：
+
+```bash
+docker build -t ghcr.io/ownercm/proxy-tool:latest .
+docker compose up -d
+```
 
 | 地址 | 用途 |
 | --- | --- |
