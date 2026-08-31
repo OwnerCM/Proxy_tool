@@ -31,6 +31,8 @@
 3. 启动前检查脚本在不在 —— 改了代码后文件被改名/挪走时立刻报错，而非运行时静默降级
 4. 任一进程退出 → 停掉其余进程 → 以非零码退出，交给 Docker 重启
 5. 收到 SIGTERM/SIGINT → 优雅停掉全部进程（含它们派生的孙进程）
+6. `--healthcheck` 模式供 Dockerfile 的 HEALTHCHECK 调用 —— 与上面共用
+   同一套 SVC_* 判定，不必在 shell 里再写一遍
 
 环境变量
 --------
@@ -215,7 +217,42 @@ def stop_all(services):
     log("全部进程已停止")
 
 
+def healthcheck():
+    """容器健康检查（Dockerfile 的 HEALTHCHECK 调这里）。
+
+    折进本模块而不是单独写个 shell 脚本，是为了复用上面这套 SVC_* 判定 ——
+    否则同一份"哪些服务算启用"的逻辑要在 Python 和 shell 里各写一遍。
+    只检查被启用的服务，避免关掉某个服务后健康检查恒失败。
+    """
+    import urllib.error
+    import urllib.request
+
+    targets = []
+    if truthy(os.environ.get("SVC_PROXY_POOL")):
+        port = os.environ.get("PORT", "5010")
+        targets.append(("proxy_pool API", f"http://127.0.0.1:{port}/count/"))
+    if truthy(os.environ.get("SVC_WEB", os.environ.get("SVC_DASHBOARD"))):
+        port = os.environ.get("WEB_PORT", "5050")
+        targets.append(("展示层", f"http://127.0.0.1:{port}/api/stats"))
+
+    # 不继承环境里的 HTTP_PROXY，否则探测本机端口会被绕出去
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for label, url in targets:
+        try:
+            with opener.open(url, timeout=8) as resp:
+                if resp.status != 200:
+                    print(f"{label} 返回 {resp.status}")
+                    return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"{label} 探测失败: {exc}")
+            return 1
+    return 0
+
+
 def main():
+    if "--healthcheck" in sys.argv[1:]:
+        return healthcheck()
+
     env = resolve_env()
     services = build_services(env)
     if not services:

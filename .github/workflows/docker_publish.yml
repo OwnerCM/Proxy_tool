@@ -45,7 +45,7 @@ jobs:
           python-version: '3.10'   # 与镜像里的 Python 版本保持一致
 
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-test.txt -r dashboard/requirements.txt
+        run: pip install -r requirements.txt -r requirements-test.txt
 
       - name: proxy_pool test suite
         run: pytest -q
@@ -57,10 +57,10 @@ jobs:
         env:
           REDIS_HOST: 127.0.0.1
         run: |
-          python -m compileall -q dashboard docker
-          python docker/assert_layout.py collisions
-          python docker/assert_layout.py proxy_pool
-          cd dashboard && python ../docker/assert_layout.py web
+          python -m compileall -q web docker
+          python docker/selfcheck.py collisions
+          python docker/selfcheck.py proxy_pool
+          cd web && python ../docker/selfcheck.py web
 
   build:
     needs: test

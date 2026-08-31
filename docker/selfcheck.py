@@ -4,9 +4,9 @@
 检查的是"改了代码之后还成立吗"这类前提，出问题时让构建立刻失败，
 而不是等到运行时才静默降级（ip2region 那条链路就是这么被藏了很久的）。
 
-    python docker/assert_layout.py proxy_pool   # 在 proxy_pool 源码目录下运行
-    cd dashboard && python ../docker/assert_layout.py web
-    python docker/assert_layout.py collisions   # 在仓库根目录运行
+    python docker/selfcheck.py proxy_pool   # 在 proxy_pool 源码目录下运行
+    cd web && python ../docker/selfcheck.py web
+    python docker/selfcheck.py collisions   # 在仓库根目录运行
 
 断言都相对当前工作目录，不写死绝对路径，因此本地和镜像里跑的是同一套逻辑。
 """
@@ -64,14 +64,14 @@ def check_web():
 def check_collisions():
     """镜像里两份代码放在同一目录，顶层模块名不能撞。
 
-    原本 dashboard 有个 ip2region 的 util.py，和 proxy_pool 的 util/ 包同名，
+    原本 web/ 里有个 ip2region 的 util.py，和 proxy_pool 的 util/ 包同名，
     放一起会互相遮蔽而且是**静默**的（表现只是地理定位悄悄失效）。
     那个文件已随采集器一并删除，这里把"不许再撞"这条固化成断言，
     以后往任一侧加文件时会立刻发现。
     """
     proxy_pool = {"api", "db", "fetcher", "handler", "helper", "util",
                   "proxyPool", "setting"}
-    web_dir = "dashboard"
+    web_dir = "web"
     if not os.path.isdir(web_dir):
         fail(f"找不到 {web_dir}/，请在仓库根目录运行")
 

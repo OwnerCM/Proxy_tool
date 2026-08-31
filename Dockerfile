@@ -5,8 +5,8 @@
 # 多架构：linux/amd64 + linux/arm64
 #
 # 全部代码都放在 /app，两份源码不做目录隔离 —— 顶层模块名没有交集，
-# 构建期由 assert_layout.py collisions 把"不许再撞"这条固化成断言。
-# （历史原因：dashboard 曾有个 ip2region 的 util.py 与 proxy_pool 的 util/ 包同名，
+# 构建期由 selfcheck.py collisions 把"不许再撞"这条固化成断言。
+# （历史原因：web/ 曾有个 ip2region 的 util.py 与 proxy_pool 的 util/ 包同名，
 #   会互相静默遮蔽，所以当初分了目录；那个文件已随采集器一并删除。）
 #
 # ── 与上游 jhao104/proxy_pool 镜像的差异 ──
@@ -40,11 +40,10 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /tmp/build
-# 两份 requirements 一起装：proxy_pool 声明 redis>=4.2.0、展示层声明 redis==5.2.1，
-# pip 解析后取 5.2.1，无冲突（已用 --dry-run 验证）。
-COPY requirements.txt ./requirements.txt
-COPY dashboard/requirements.txt ./requirements-web.txt
-RUN pip install -r requirements.txt -r requirements-web.txt
+# 只有一份依赖清单。展示层唯一的额外依赖是 redis，已并入根 requirements.txt
+# 并锁定版本（原来 web/ 下那份是双镜像时代的遗留，已删）。
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
 # ══════════ runtime ══════════
 FROM python:3.10-slim-bookworm
@@ -87,12 +86,8 @@ COPY handler/ ./handler/
 COPY helper/ ./helper/
 COPY util/ ./util/
 COPY proxyPool.py setting.py ./
-# 显式列举而不是 COPY dashboard/ ./ —— 后者会让 dashboard/requirements.txt
-# 覆盖 proxy_pool 的同名文件，虽然运行时用不到但很容易看错
-COPY dashboard/web.py dashboard/gateway.py dashboard/geo.py ./
-COPY dashboard/static/ ./static/
-COPY dashboard/data/ ./data/
-COPY docker/supervisor.py docker/healthcheck.sh docker/assert_layout.py /opt/proxy-tool/
+COPY web/ ./
+COPY docker/supervisor.py docker/selfcheck.py /opt/proxy-tool/
 
 # ── 构建期自检 ──
 # 改了代码后如果前提不成立（模块名撞了、采集源没被发现、Proxy 少了 latency 字段、
@@ -100,8 +95,8 @@ COPY docker/supervisor.py docker/healthcheck.sh docker/assert_layout.py /opt/pro
 # 而不是等到运行时才静默降级 —— ip2region 那条链路就是这么被藏了很久的。
 RUN set -eux; \
     python proxyPool.py --help > /dev/null; \
-    python /opt/proxy-tool/assert_layout.py proxy_pool; \
-    python /opt/proxy-tool/assert_layout.py web; \
+    python /opt/proxy-tool/selfcheck.py proxy_pool; \
+    python /opt/proxy-tool/selfcheck.py web; \
     python -m compileall -q /app /opt/proxy-tool
 
 # ── 运行账户与可写目录 ──
@@ -110,7 +105,6 @@ RUN set -eux; \
 RUN groupadd --gid 10001 app \
     && useradd --create-home --shell /usr/sbin/nologin --uid 10001 --gid 10001 app \
     && mkdir -p /app/log \
-    && chmod +x /opt/proxy-tool/healthcheck.sh \
     && chown -R 10001:10001 /app /opt/proxy-tool
 
 USER 10001:10001
@@ -143,10 +137,9 @@ ENV REDIS_HOST=redis \
 # 5010 proxy_pool 原生 API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
 EXPOSE 5010 5050 8080 1080
 
-# HEALTHCHECK 必须用 shell 形式（脚本内部有条件判断）
-# hadolint ignore=DL3025
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /opt/proxy-tool/healthcheck.sh
+# 健康检查复用 supervisor 的 SVC_* 判定，只探测被启用的服务
+HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+    CMD ["python", "/opt/proxy-tool/supervisor.py", "--healthcheck"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "/opt/proxy-tool/supervisor.py"]

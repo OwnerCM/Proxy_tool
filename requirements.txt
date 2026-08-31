@@ -1,7 +1,7 @@
 requests==2.31.0
 gunicorn==19.9.0
 lxml==4.9.2
-redis>=4.2.0
+redis==5.2.1        # 锁定版本以保证多架构构建可复现（纯 Python，两架构同一 wheel）
 APScheduler==3.10.0;python_version>="3.10"
 APScheduler==3.2.0;python_version<"3.10"
 click==8.0.1

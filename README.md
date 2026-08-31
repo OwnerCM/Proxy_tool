@@ -103,8 +103,8 @@ docker compose up -d --build
 | --- | --- | --- |
 | 数据平面 | proxy_pool | **唯一**写代理数据的地方：采集、验证、淘汰、原生 API |
 | 采集源 | proxy_pool 的 24 个 fetcher | 原有 14 个 + 移植进来的 10 个 GitHub 列表源 |
-| 展示 | `dashboard/web.py` | 只读 DB 0，不写任何代理数据 |
-| 出口 | `dashboard/gateway.py` | 固定入口，逐请求轮换上游；由 web 进程托管 |
+| 展示 | `web/web.py` | 只读 DB 0，不写任何代理数据 |
+| 出口 | `web/gateway.py` | 固定入口，逐请求轮换上游；由 web 进程托管 |
 
 Redis 的 DB 0 存代理数据（proxy_pool 的 `use_proxy` hash），DB 1 只被 `geo.py`
 用作地理信息缓存，不是第二个数据平面。
@@ -256,7 +256,7 @@ proxy_pool 的调度是**每 5 分钟采集一轮、每 2 分钟全量复检**�
 | `GATEWAY_FAIL_THRESHOLD` | `2` | 连续失败几次后拉黑 |
 | `GATEWAY_COOLDOWN` | `300` | 拉黑时长（秒） |
 
-完整清单见 `dashboard/gateway.py` 与 `dashboard/web.py` 的模块头注释。
+完整清单见 `web/gateway.py` 与 `web/web.py` 的模块头注释。
 proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.py`）。
 
 ---
@@ -289,7 +289,7 @@ proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.p
 删除了 9 个文件（`backend.py`、`frontend.py`、`validator.py`、`quality.py`、
 `new_fetcher.py`、`searcher.py`、`util.py`、`dashboard.py`、`bridge.py`）
 和 10MB 的 `data/ip2region.xdb` —— 它们构成的那套采集/验证/存储与 proxy_pool 完全重复。
-目录体积从 14MB 降到 3.5MB。
+目录体积从 14MB 降到 3.5MB（目录也随之从 `dashboard/` 更名为 `web/`，因为它现在只承载展示层和网关）。
 
 保留 `geo.py`（GeoIP，含离线库 `data/ipdb.bin`）与 `static/`（前端 SPA），
 新增 `web.py`（只读展示层，同时托管静态文件）和 `gateway.py`（轮换网关）。
@@ -311,18 +311,15 @@ proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.p
 ├── Dockerfile                  # 合并镜像
 ├── docker-compose.yml          # 两个容器：redis + proxy-tool
 ├── docker/
-│   ├── supervisor.py           # 容器内进程管理
-│   ├── assert_layout.py        # 构建期自检，Dockerfile 与 CI 共用
-│   └── healthcheck.sh
+│   ├── supervisor.py           # 容器内进程管理 + 健康检查（--healthcheck）
+│   └── selfcheck.py            # 构建期自检，Dockerfile 与 CI 共用
 ├── api/ db/ fetcher/ handler/ helper/ util/    # proxy_pool 源码
 │   └── fetcher/sources/github_lists.py         #   └─ 新增的 GitHub 列表源
 ├── proxyPool.py  setting.py  requirements.txt
-├── proxy_pool.sh               # 上游的启动脚本，容器不用，保留供本地直接运行
-├── tests/                      # proxy_pool 测试（248 例）
-├── docs/                       # proxy_pool 的 mkdocs 文档
-└── dashboard/
+├── tests/  pyproject.toml  requirements-test.txt   # proxy_pool 测试（248 例）
+└── web/
     ├── web.py                  # 只读展示层（自研）
-    ├── gateway.py              # 轮换代理网关（自研）
+    ├── gateway.py              # 轮换代理网关（自研，由 web 进程托管）
     ├── geo.py                  # GeoIP（上游）
     ├── data/ipdb.bin           # 离线 GeoIP 库，运行必需
     └── static/                 # 前端 SPA（上游）
@@ -334,16 +331,15 @@ proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.p
 
 ```bash
 hadolint Dockerfile
-shellcheck docker/healthcheck.sh
 actionlint
 docker compose config -q
 
-pip install -r requirements.txt -r requirements-test.txt -r dashboard/requirements.txt
+pip install -r requirements.txt -r requirements-test.txt
 pytest -q
 
-python docker/assert_layout.py collisions
-python docker/assert_layout.py proxy_pool
-cd dashboard && python ../docker/assert_layout.py web
+python docker/selfcheck.py collisions
+python docker/selfcheck.py proxy_pool
+cd web && python ../docker/selfcheck.py web
 ```
 
 ---
@@ -354,7 +350,7 @@ cd dashboard && python ../docker/assert_layout.py web
 - **proxy-pool-dashboard** — 上游仓库**未声明许可证**，默认即保留所有权利。
   本项目保留其 `geo.py` 与 `static/`。自用没问题；若要公开分发或商用，
   建议先联系原作者确认授权。
-- `dashboard/data/ipdb.bin` 源自 DB-IP Country Lite，适用其原始许可条款。
+- `web/data/ipdb.bin` 源自 DB-IP Country Lite，适用其原始许可条款。
 - GitHub 代理列表源的 URL 清单参考了 `abclq/proxy-pool-tools`。
 
 本项目新增的 `web.py`、`gateway.py`、`docker/` 下的脚本、`github_lists.py`、

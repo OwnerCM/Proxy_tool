@@ -3,14 +3,9 @@
 .gitignore
 .dockerignore
 
-docs/
 tests/
-mkdocs.yml
-tox.ini
-_config.yml
 pyproject.toml
 requirements-test.txt
-proxy_pool.sh
 docker-compose.yml
 *.md
 
