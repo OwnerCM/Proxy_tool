@@ -58,6 +58,7 @@ jobs:
           REDIS_HOST: 127.0.0.1
         run: |
           python -m compileall -q dashboard docker
+          python docker/assert_layout.py collisions
           python docker/assert_layout.py proxy_pool
           cd dashboard && python ../docker/assert_layout.py web
 

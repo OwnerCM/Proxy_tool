@@ -84,15 +84,19 @@ docker compose up -d --build
 **职责单一，不重复。** 这一点是踩过坑才定下来的 —— 见下文「为什么不是简单合并」。
 
 ```
-┌─ proxy-redis ────────┐        ┌─ proxy-tool（单容器，4 个进程）──────────────┐
+┌─ proxy-redis ────────┐        ┌─ proxy-tool（单容器，3 个进程）──────────────┐
 │  redis:7-alpine      │        │  tini                                        │
 │                      │        │   └── docker/supervisor.py                   │
-│  DB 0  代理数据       │◄───────┤        ├── pp-api    :5010  原生 API          │
-│  DB 1  geo 缓存       │        │        ├── pp-sched         采集 + 验证       │
-└──────────────────────┘        │        ├── web       :5050  只读展示层        │
-                                │        └── gateway   :8080  HTTP 代理入口     │
-                                │                      :1080  SOCKS5 入口       │
+│  DB 0  代理数据       │◄───────┤        ├── api      :5010  原生 API           │
+│  DB 1  geo 缓存       │        │        ├── schedule        采集 + 验证        │
+└──────────────────────┘        │        └── serve    :5050  看板               │
+                                │                     :8080  网关(HTTP)        │
+                                │                     :1080  网关(SOCKS5)      │
                                 └──────────────────────────────────────────────┘
+
+三个进程都是阻塞式的，合不了：`api` 是 gunicorn（自己还 fork 4 个 worker），
+`schedule` 是 APScheduler 的 BlockingScheduler。看板和网关都是线程模型，
+已经合并进 `serve` 一个进程。
 ```
 
 | 层 | 谁负责 | 说明 |
@@ -100,7 +104,7 @@ docker compose up -d --build
 | 数据平面 | proxy_pool | **唯一**写代理数据的地方：采集、验证、淘汰、原生 API |
 | 采集源 | proxy_pool 的 24 个 fetcher | 原有 14 个 + 移植进来的 10 个 GitHub 列表源 |
 | 展示 | `dashboard/web.py` | 只读 DB 0，不写任何代理数据 |
-| 出口 | `dashboard/gateway.py` | 固定入口，逐请求轮换上游 |
+| 出口 | `dashboard/gateway.py` | 固定入口，逐请求轮换上游；由 web 进程托管 |
 
 Redis 的 DB 0 存代理数据（proxy_pool 的 `use_proxy` hash），DB 1 只被 `geo.py`
 用作地理信息缓存，不是第二个数据平面。
@@ -129,18 +133,23 @@ proxy_pool 的 fetcher 框架。看板自带的采集器、验证器、质量统
 
 ### 进程管理
 
-容器里用 `docker/supervisor.py` 统一管这 4 个进程，而不是沿用上游各自的启动方式：
+容器里用 `docker/supervisor.py` 统一管这 3 个进程，而不是沿用上游各自的启动方式：
 
 - proxy_pool 的 `proxy_pool.sh` 只是拉起 `proxyPool.py server` 和 `schedule`，
   这里直接调这两个 click 子命令，脚本和它的 bash 依赖都不需要了。
 - 看板原来的看门狗 `dashboard.py` 已随其采集/验证进程一并删除。
 
-supervisor 提供的额外好处：
+它做三件事：
 
 - 给每个进程的输出加 `[名字]` 前缀再转发到容器 stdout
-- 崩溃后指数退避重启（2s→4s→…→60s 上限，稳定 120s 后重置）
 - SIGTERM/SIGINT 时优雅停机，连子进程派生的孙进程一起清掉
 - 启动前自检脚本和离线库是否就位，缺了立刻报错而不是运行时静默降级
+
+**容错取向是 crash-only**：任一进程退出就结束整个容器，由 Docker 的 restart 策略
+统一重启（自带指数退避），容器内部不做单进程重启和退避。这样少掉一整套
+退避/计数/稳定期判定的逻辑；更重要的是进程反复挂会直接表现为容器反复重启，
+在监控上可见，而不是被"容器内部悄悄重启、对外仍然 healthy"掩盖。
+代价是一个进程挂会连带重启另两个 —— 状态全在外部 Redis 里，代价是几秒钟中断。
 
 ```bash
 docker compose logs -f proxy-tool
@@ -298,7 +307,7 @@ proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.p
 
 ```
 .
-├── .github/workflows/ci.yml    # 唯一的 workflow：测试 → 多架构构建 → 发布 GHCR
+├── .github/workflows/docker_publish.yml   # 唯一的 workflow：测试 → 多架构构建 → 发布 GHCR
 ├── Dockerfile                  # 合并镜像
 ├── docker-compose.yml          # 两个容器：redis + proxy-tool
 ├── docker/
@@ -332,6 +341,7 @@ docker compose config -q
 pip install -r requirements.txt -r requirements-test.txt -r dashboard/requirements.txt
 pytest -q
 
+python docker/assert_layout.py collisions
 python docker/assert_layout.py proxy_pool
 cd dashboard && python ../docker/assert_layout.py web
 ```

@@ -807,13 +807,19 @@ def _refresh_loop():
         time.sleep(REFRESH)
 
 
-def main():
+def start():
+    """把网关的监听和后台刷新都起成守护线程后立即返回。
+
+    拆出这个函数是为了让 web.py 能在同一个进程里托管网关 —— 网关本来就全是
+    线程模型，单独占一个进程只是多一份开销。返回已启动的 server 列表，
+    调用方想关的时候自己 shutdown；不关也无所谓，都是 daemon 线程。
+    """
     if not ENABLED:
         log("GATEWAY_ENABLED=0，网关不启用")
-        return 0
+        return []
     if HTTP_PORT <= 0 and SOCKS_PORT <= 0:
         log("HTTP 与 SOCKS 端口都被关闭，网关无事可做")
-        return 0
+        return []
 
     if not AUTH_USER:
         log("⚠️  未设置 GATEWAY_USER/GATEWAY_PASS —— 这是一个无鉴权的开放代理，"
@@ -837,7 +843,14 @@ def main():
     for name, server in servers:
         log(f"{name} 监听 {BIND}:{server.server_address[1]}")
         threading.Thread(target=server.serve_forever, daemon=True).start()
+    return servers
 
+
+def main():
+    """单独运行网关时的入口（容器里是由 web.py 托管的，不走这里）。"""
+    servers = start()
+    if not servers:
+        return 0
     try:
         while True:
             time.sleep(3600)

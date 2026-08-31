@@ -70,6 +70,12 @@ def log(msg):
     print(f"[web] {msg}", flush=True)
 
 
+def truthy(value, default=True):
+    if value is None or value == "":
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 # ────────────────────────── 数据读取 ──────────────────────────
 
 def _country_of(ip, region):
@@ -321,6 +327,18 @@ def main():
         log("geo 后台填充线程已启动")
     except Exception as exc:  # noqa: BLE001
         log(f"geo 后台填充线程启动失败（地理信息会退化为离线库）: {exc}")
+
+    # 顺带在本进程里托管网关。网关本来就全是线程模型（HTTP/SOCKS5 监听 + 上游刷新
+    # 都是 daemon 线程），单独占一个进程只是多一份解释器开销。
+    # 它自己的日志带 [gateway] 前缀，混在一起也分得清。
+    if truthy(os.environ.get("SVC_GATEWAY", os.environ.get("GATEWAY_ENABLED"))):
+        try:
+            import gateway
+            gateway.start()
+        except Exception as exc:  # noqa: BLE001 - 网关起不来不该拖垮看板
+            log(f"网关启动失败: {exc.__class__.__name__}: {exc}")
+    else:
+        log("SVC_GATEWAY=0，网关不启用")
 
     server = ThreadingHTTPServer((WEB_BIND, WEB_PORT), Handler)
     server.daemon_threads = True

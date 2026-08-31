@@ -4,14 +4,10 @@
 # Redis 是独立容器，见 docker-compose.yml。
 # 多架构：linux/amd64 + linux/arm64
 #
-# ── 镜像内部布局 ──
-#   /opt/proxy_pool   ← 仓库根目录的 proxy_pool 源码（采集 + 验证 + 原生 API）
-#   /app              ← 仓库的 dashboard/（只读展示层 + 网关）
-#   /opt/proxy-tool   ← 进程管理器、健康检查、构建期自检脚本
-#
-#   两份代码分开放而不是塞进同一目录，是因为各自都以自己的目录为 cwd 运行
-#   （Python 会把脚本所在目录放到 sys.path 首位），分开能避免任何同名模块互相遮蔽。
-#   proxy_pool 源码里没有绝对路径，可以自由重定位。
+# 全部代码都放在 /app，两份源码不做目录隔离 —— 顶层模块名没有交集，
+# 构建期由 assert_layout.py collisions 把"不许再撞"这条固化成断言。
+# （历史原因：dashboard 曾有个 ip2region 的 util.py 与 proxy_pool 的 util/ 包同名，
+#   会互相静默遮蔽，所以当初分了目录；那个文件已随采集器一并删除。）
 #
 # ── 与上游 jhao104/proxy_pool 镜像的差异 ──
 #   1. 基础镜像 python:3.10-alpine → python:3.10-slim-bookworm。
@@ -80,14 +76,10 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
-    APP_DIR=/app \
-    PP_DIR=/opt/proxy_pool
+    APP_DIR=/app
 
-# ── 代码就位 ──
-COPY dashboard/ /app/
-COPY docker/supervisor.py docker/healthcheck.sh docker/assert_layout.py /opt/proxy-tool/
-
-WORKDIR /opt/proxy_pool
+# ── 代码就位：两份源码同放 /app ──
+WORKDIR /app
 COPY api/ ./api/
 COPY db/ ./db/
 COPY fetcher/ ./fetcher/
@@ -95,30 +87,31 @@ COPY handler/ ./handler/
 COPY helper/ ./helper/
 COPY util/ ./util/
 COPY proxyPool.py setting.py ./
+# 显式列举而不是 COPY dashboard/ ./ —— 后者会让 dashboard/requirements.txt
+# 覆盖 proxy_pool 的同名文件，虽然运行时用不到但很容易看错
+COPY dashboard/web.py dashboard/gateway.py dashboard/geo.py ./
+COPY dashboard/static/ ./static/
+COPY dashboard/data/ ./data/
+COPY docker/supervisor.py docker/healthcheck.sh docker/assert_layout.py /opt/proxy-tool/
 
 # ── 构建期自检 ──
-# 改了代码之后如果前提不成立（采集源没被发现、Proxy 少了 latency 字段、
-# 离线 GeoIP 库损坏、静态资源缺失），构建会直接失败，
+# 改了代码后如果前提不成立（模块名撞了、采集源没被发现、Proxy 少了 latency 字段、
+# 离线 GeoIP 库损坏、静态资源缺失），构建直接失败，
 # 而不是等到运行时才静默降级 —— ip2region 那条链路就是这么被藏了很久的。
-#
-# 两个自检要在各自的代码目录下跑，需要在一条 RUN 里切换目录，WORKDIR 做不到。
-# hadolint ignore=DL3003
 RUN set -eux; \
-    cd /opt/proxy_pool; \
     python proxyPool.py --help > /dev/null; \
     python /opt/proxy-tool/assert_layout.py proxy_pool; \
-    cd /app; \
     python /opt/proxy-tool/assert_layout.py web; \
-    python -m compileall -q /app /opt/proxy_pool /opt/proxy-tool
+    python -m compileall -q /app /opt/proxy-tool
 
 # ── 运行账户与可写目录 ──
-# /opt/proxy_pool/log : 上游 handler/logHandler.py 在 import 时就会创建并写入该目录
+# /app/log : 上游 handler/logHandler.py 在 import 时就会创建并写入该目录
 # 显式建组：useradd 自动分配的 GID 不保证等于 UID，而下面 USER 用的是固定数字。
 RUN groupadd --gid 10001 app \
     && useradd --create-home --shell /usr/sbin/nologin --uid 10001 --gid 10001 app \
-    && mkdir -p /opt/proxy_pool/log \
+    && mkdir -p /app/log \
     && chmod +x /opt/proxy-tool/healthcheck.sh \
-    && chown -R 10001:10001 /app /opt/proxy_pool /opt/proxy-tool
+    && chown -R 10001:10001 /app /opt/proxy-tool
 
 USER 10001:10001
 
@@ -126,7 +119,7 @@ USER 10001:10001
 # 全部通过 ENV 提供，好处是 docker exec 进去手动跑脚本时也能拿到一致的配置。
 #
 # REDIS_HOST 默认取 "redis"，正好等于 docker-compose.yml 里 Redis 的服务名，
-# 所以 compose 那边一行 environment 都不用写。
+# 所以 compose 那边不用为此写 environment。
 # 独立 docker run 时按需覆盖：-e REDIS_HOST=<你的 redis 地址>
 #
 # PROXY_POOL_DB=0 是代理数据所在的库；DB 1 只被 geo.py 用作地理缓存。

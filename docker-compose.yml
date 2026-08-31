@@ -53,8 +53,13 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # docker stop 默认只等 10s，而容器里有几个进程要收尾（supervisor 的停机上界
+    # docker stop 默认只等 10s，而容器里有 3 个进程要收尾（supervisor 的停机上界
     # 约为 STOP_TIMEOUT + 进程数×1s）。给足余量，避免收尾被 SIGKILL 打断。
+    #
+    # restart 策略也是容错机制的一部分：supervisor 采用 crash-only —— 任一进程
+    # 退出就结束整个容器，由 Docker 负责重启（自带指数退避），
+    # 容器内部不做单进程重启。这样进程反复挂会直接表现为容器反复重启，
+    # 在监控上是可见的，而不是被"容器仍然 healthy"掩盖掉。
     stop_grace_period: 30s
     logging:
       driver: 'json-file'
