@@ -119,16 +119,14 @@ USER 10001:10001
 # PROXY_POOL_DB=0 是代理数据所在的库；DB 1 只被 geo.py 用作地理缓存。
 # PROXY_API 指向 127.0.0.1 是对的 —— proxy_pool 和展示层同在一个容器里。
 #
-# NO_PROXY 是必须的：容器里一旦存在 HTTP_PROXY（Docker 会把宿主机
-# ~/.docker/config.json 里的 proxies 自动注入），访问本机 Redis 与 proxy_pool
-# 的请求就会被送去外部代理而失败。大小写两份都给：urllib 与 requests
-# 读取的变量名大小写不一致。
+# 刻意不设 NO_PROXY。容器里访问本机的 HTTP 调用只有两处（gateway 读 proxy_pool
+# 的 /all/、supervisor 的健康检查），它们都在代码里用 ProxyHandler({}) 显式禁用了
+# 代理 —— 这比 NO_PROXY 可靠：Docker 注入代理配置时会同时写大小写两个变量，
+# 只覆盖其中一个的话，另一个（Docker 的值）会被 urllib 和 requests 优先采纳。
 ENV REDIS_HOST=redis \
     REDIS_PORT=6379 \
     PROXY_POOL_DB=0 \
-    PROXY_API=http://127.0.0.1:5010 \
-    NO_PROXY=localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool \
-    no_proxy=localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool
+    PROXY_API=http://127.0.0.1:5010
 
 # 刻意不在这里设置 DB_CONN（proxy_pool 的库地址）。
 # 它由 supervisor.py 从 REDIS_HOST/REDIS_PORT/REDIS_PASSWORD 推导后传给子进程；

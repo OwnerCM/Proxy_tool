@@ -203,7 +203,11 @@ class UpstreamPool:
             return []
         req = urllib.request.Request(f"{PROXY_API}/all/",
                                      headers={"User-Agent": "proxy-pool-gateway/1.0"})
-        # 不继承环境里的 HTTP_PROXY，否则会绕道
+        # 这个 ProxyHandler({}) 不能删。PROXY_API 指向的是本机（同容器内的
+        # proxy_pool），而宿主机若配了 docker 代理，Docker 会把 HTTP_PROXY 注入容器，
+        # 用默认 opener 的话这个内部请求会被送去外部代理而失败。
+        # 靠代码禁用比靠 NO_PROXY 可靠：Docker 会同时注入大小写两个变量，
+        # 只覆盖其中一个时另一个会被优先采纳（所以本项目不再设 NO_PROXY）。
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=DIAL_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))

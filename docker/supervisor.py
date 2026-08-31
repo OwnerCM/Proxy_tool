@@ -235,7 +235,9 @@ def healthcheck():
         port = os.environ.get("WEB_PORT", "5050")
         targets.append(("展示层", f"http://127.0.0.1:{port}/api/stats"))
 
-    # 不继承环境里的 HTTP_PROXY，否则探测本机端口会被绕出去
+    # 这个 ProxyHandler({}) 不能删：探的是本机端口，而宿主机若配了 docker 代理，
+    # Docker 会把 HTTP_PROXY 注入容器，用默认 opener 会把探测请求送去外部代理。
+    # 靠代码禁用比靠 NO_PROXY 可靠（详见 Dockerfile 里 ENV 处的说明）。
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for label, url in targets:
         try:
