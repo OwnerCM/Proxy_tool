@@ -20,7 +20,8 @@ async function loadStats() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     const bar = document.getElementById('stats-bar');
-    bar.textContent = `共 ${d.total.toLocaleString()} 节点 · ${Object.keys(d.regions||{}).length} 个国家 · 仅展示 <500ms`;
+    // 数据源已改为 proxy_pool，不再有"只留 <500ms"那条质量门槛，所以不再宣称
+    bar.textContent = `共 ${d.total.toLocaleString()} 节点 · ${Object.keys(d.regions||{}).length} 个国家`;
   } catch(e) {}
 }
 
@@ -98,9 +99,11 @@ function drillInto(code, name) {
   document.getElementById('f-search').value = '';
   document.getElementById('f-sort').value = '';
   // Populate protocol filter
+  // 只给 http/https：proxy_pool 的校验器用 requests 的 proxies 参数，验不了 socks，
+  // 池子里不会有 socks 代理，列出来只会筛出空结果
   const protoSel = document.getElementById('f-proto');
   protoSel.innerHTML = '<option value="">全部协议</option>' +
-    ['http','https','socks4','socks5'].map(p => `<option value="${p}">${p.toUpperCase()}</option>`).join('');
+    ['http','https'].map(p => `<option value="${p}">${p.toUpperCase()}</option>`).join('');
   loadDetail(1);
 }
 

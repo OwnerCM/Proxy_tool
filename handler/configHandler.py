@@ -74,6 +74,11 @@ class ConfigHandler(withMetaclass(Singleton)):
         return int(os.getenv("POOL_SIZE_MIN", setting.POOL_SIZE_MIN))
 
     @LazyProperty
+    def proxyCheckThreads(self):
+        return int(os.getenv("PROXY_CHECK_THREADS",
+                             getattr(setting, "PROXY_CHECK_THREADS", 20)))
+
+    @LazyProperty
     def proxyRegion(self):
         return bool(os.getenv("PROXY_REGION", setting.PROXY_REGION))
 

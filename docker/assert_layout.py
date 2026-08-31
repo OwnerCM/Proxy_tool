@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
-"""构建期布局断言 —— 由 Dockerfile 调用，也可以在本地直接跑。
+"""构建期自检 —— 由 Dockerfile 与 CI 共同调用，也可以在本地直接跑。
 
-合并镜像最容易出错的地方是 proxy_pool 和 dashboard 都有一个叫 `util` 的顶层模块：
-proxy_pool 的是 util/ 包，dashboard 的是 ip2region 的 util.py。
-两者一旦落在同一目录或同一 sys.path 上，就会互相覆盖 —— 而且是**静默**覆盖，
-表现只是 ip2region 地理定位悄悄失效，很难发现。
+检查的是"改了代码之后还成立吗"这类前提，出问题时让构建立刻失败，
+而不是等到运行时才静默降级（ip2region 那条链路就是这么被藏了很久的）。
 
-所以镜像把它们分开放（dashboard 在 /app，proxy_pool 在 /opt/proxy_pool），
-并用这个脚本在构建期把这条约束钉死：将来更新代码后如果布局被破坏，
-构建会直接失败，而不是等到线上才发现定位数据不对。
+    python docker/assert_layout.py proxy_pool   # 在 proxy_pool 源码目录下运行
+    cd dashboard && python ../docker/assert_layout.py web
 
-断言都相对当前工作目录，不写死绝对路径，这样本地模拟镜像布局时能跑同一套逻辑：
-
-    cd <dashboard 目录>  && python docker/assert_layout.py dashboard
-    cd <proxy_pool 目录> && python docker/assert_layout.py proxy_pool
-
-用法：assert_layout.py {proxy_pool|dashboard}
+断言都相对当前工作目录，不写死绝对路径，因此本地和镜像里跑的是同一套逻辑。
 """
 
 import os
@@ -23,69 +15,53 @@ import sys
 
 
 def fail(msg):
-    print(f"❌ 布局断言失败: {msg}", file=sys.stderr)
+    print(f"❌ 自检失败: {msg}", file=sys.stderr)
     raise SystemExit(1)
 
 
-def resolved(path):
-    return os.path.realpath(path)
-
-
-def check_util_is_local(expect_package):
-    """`import util` 必须解析到当前目录下的那一个。"""
-    import util
-
-    path = resolved(util.__file__)
-    cwd = resolved(os.getcwd())
-    if not path.startswith(cwd + os.sep):
-        fail(f"import util 解析到了 {path}，它不在当前目录 {cwd} 下 —— "
-             f"说明 proxy_pool 与 dashboard 的 util 发生了串台")
-
-    is_package = os.path.basename(path) == "__init__.py"
-    if expect_package and not is_package:
-        fail(f"这里的 util 应该是 proxy_pool 的 util/ 包，实际是 {path}")
-    if not expect_package and is_package:
-        fail(f"这里的 util 应该是 dashboard 的 ip2region util.py，实际是 {path}")
-    return path
-
-
 def check_proxy_pool():
-    path = check_util_is_local(expect_package=True)
-    print(f"✅ proxy_pool: util -> {path}")
+    """proxy_pool 侧：CLI 可用、采集源能被发现、latency 字段在。"""
+    from helper.proxy import Proxy
+
+    if "latency" not in Proxy("1.2.3.4:8080").to_dict:
+        fail("Proxy.to_dict 缺少 latency 字段 —— 看板的延迟列与 gateway 择优会失效")
+
+    from handler.configHandler import ConfigHandler
+    from helper.fetch import _discover_fetchers
+
+    fetchers = _discover_fetchers(ConfigHandler().fetcherExclude)
+    names = [c.name for c in fetchers]
+    github = [n for n in names if n.startswith("github-")]
+    if not github:
+        fail("没有发现任何 github-* 采集源，fetcher/sources/github_lists.py 可能已失效")
+    print(f"✅ proxy_pool: {len(names)} 个采集源（含 {len(github)} 个 GitHub 源），"
+          f"Proxy 含 latency 字段")
 
 
-def check_dashboard():
-    path = check_util_is_local(expect_package=False)
-    print(f"✅ dashboard: util -> {path}")
+def check_web():
+    """展示层：模块能导入、离线 GeoIP 可用、静态资源在。"""
+    for rel in ("static/index.html", "static/app.js", "data/ipdb.bin"):
+        if not os.path.exists(rel):
+            fail(f"缺少 {rel}")
 
-    # ip2region 离线库真查一次。上游这条链路本来是坏的
-    # （searcher.py 里 import 了一个不存在的 ip2region 包），修好后必须保持可用。
-    import searcher
-    import util
+    import geo
 
-    xdb = os.path.join("data", "ip2region.xdb")
-    if not os.path.exists(xdb):
-        fail(f"离线库 {xdb} 不存在")
-    result = searcher.new_with_file_only(util.IPv4, xdb).search("114.114.114.114")
-    if "CN" not in result:
-        fail(f"ip2region 查询结果不对: {result}")
-    print(f"✅ dashboard: ip2region 可用 -> {result}")
+    if geo._local_lookup("8.8.8.8") != "US":
+        fail("离线 GeoIP 库解析异常（8.8.8.8 应为 US）—— data/ipdb.bin 可能损坏")
 
-    # 所有会被 supervisor 拉起的模块都得能导入
-    modules = ["geo", "backend", "frontend", "validator", "quality",
-               "new_fetcher", "bridge", "gateway"]
-    os.environ.setdefault("GATEWAY_ENABLED", "0")
-    for name in modules:
+    for name in ("web", "gateway"):
         __import__(name)
-    print(f"✅ dashboard: {len(modules)} 个模块均可导入")
+
+    print("✅ web: 静态资源与离线 GeoIP 就绪，web/gateway 模块可导入")
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("proxy_pool", "dashboard"):
+    if len(sys.argv) != 2 or sys.argv[1] not in ("proxy_pool", "web"):
         print(__doc__)
         return 2
     sys.path.insert(0, os.getcwd())
-    {"proxy_pool": check_proxy_pool, "dashboard": check_dashboard}[sys.argv[1]]()
+    os.environ.setdefault("GATEWAY_ENABLED", "0")
+    {"proxy_pool": check_proxy_pool, "web": check_web}[sys.argv[1]]()
     return 0
 
 

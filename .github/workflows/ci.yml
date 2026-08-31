@@ -51,13 +51,15 @@ jobs:
         run: pytest -q
 
       # assert_layout.py 与 Dockerfile 构建期调的是同一个脚本，两处不会漂移。
-      # 它挡的是这个合并项目最大的暗坑：proxy_pool 和 dashboard 都有一个叫 util 的
-      # 顶层模块，一旦串台会**静默**让 ip2region 地理定位失效。
-      - name: Layout assertions
+      # 它验证的是那些"坏了也不报错"的前提：采集源能被发现、Proxy 带 latency 字段、
+      # 离线 GeoIP 库可用、静态资源就位。
+      - name: Self checks
+        env:
+          REDIS_HOST: 127.0.0.1
         run: |
           python -m compileall -q dashboard docker
           python docker/assert_layout.py proxy_pool
-          cd dashboard && python ../docker/assert_layout.py dashboard
+          cd dashboard && python ../docker/assert_layout.py web
 
   build:
     needs: test

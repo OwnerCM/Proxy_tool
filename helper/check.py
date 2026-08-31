@@ -14,6 +14,7 @@
 """
 __author__ = 'JHao'
 
+from time import time
 from util.six import Empty
 from threading import Thread
 from datetime import datetime
@@ -39,7 +40,12 @@ class DoValidator(object):
         Returns:
             Proxy Object
         """
+        # 记录 http 校验耗时作为代理延迟。校验本身就是一次真实的代理请求，
+        # 顺手计时即可，不需要额外探测。上游没有这个字段，是为了让看板能按
+        # 延迟排序/筛选，gateway 也能优先选快的上游。
+        start = time()
         http_r = cls.httpValidator(proxy)
+        latency = int((time() - start) * 1000)
         https_r = False if not http_r else cls.httpsValidator(proxy)
 
         proxy.check_count += 1
@@ -49,10 +55,12 @@ class DoValidator(object):
             if proxy.fail_count > 0:
                 proxy.fail_count -= 1
             proxy.https = True if https_r else False
+            proxy.latency = latency
             if work_type == "raw":
                 proxy.region = cls.regionGetter(proxy) if cls.conf.proxyRegion else ""
         else:
             proxy.fail_count += 1
+            proxy.latency = 0  # 本次不可用, 清掉过期的延迟数据
         return proxy
 
     @classmethod
@@ -147,7 +155,10 @@ def Checker(tp, queue):
     :return:
     """
     thread_list = list()
-    for index in range(20):
+    # 线程数改为可配（上游写死 20）。合并 GitHub 列表源后待校验量大得多，
+    # 需要能按机器和源规模调整，见 setting.py 的 PROXY_CHECK_THREADS
+    thread_num = ConfigHandler().proxyCheckThreads
+    for index in range(thread_num):
         thread_list.append(_ThreadChecker(tp, queue, "thread_%s" % str(index).zfill(2)))
 
     for thread in thread_list:

@@ -1,9 +1,9 @@
 # Proxy Tool — 支持 arm64 的代理池 + 可视化看板 + 轮换网关
 
-把 [jhao104/proxy_pool](https://github.com/jhao104/proxy_pool)（代理采集与校验）和
-[abclq/proxy-pool-dashboard](https://github.com/abclq/proxy-pool-dashboard)（可视化看板）
-合并成**一个镜像、一个容器**，由 GitHub Actions 产出 **linux/amd64 + linux/arm64**
-双架构镜像并发布到 GHCR。
+以 [jhao104/proxy_pool](https://github.com/jhao104/proxy_pool) 为数据平面，
+把 [abclq/proxy-pool-dashboard](https://github.com/abclq/proxy-pool-dashboard) 的展示层接上，
+再加一个固定入口的轮换代理网关，打成**一个镜像、一个容器**，
+由 GitHub Actions 产出 **linux/amd64 + linux/arm64** 双架构镜像并发布到 GHCR。
 
 Apple Silicon、树莓派、AWS Graviton 上都能直接跑。
 
@@ -28,7 +28,7 @@ Apple Silicon、树莓派、AWS Graviton 上都能直接跑。
 顺带两个相关的坑：镜像 `ENTRYPOINT` 用 `bash`，但 `python:3.10-alpine` 里没有 bash
 （这就是很多人要在 compose 里覆盖 `entrypoint` 的原因）；而**覆盖成 `sh` 同样不行**，
 因为 Debian 的 `/bin/sh` 是 dash，也不支持 `proxy_pool.sh` 里的 `[[ ]]`。
-本项目不再使用 `proxy_pool.sh`，这个坑直接消失（见下文）。
+本项目不再使用 `proxy_pool.sh`，这个坑直接消失。
 
 ## 怎么解决的
 
@@ -42,13 +42,12 @@ push/tag ───►│                                   ├─► imagetools 
 
 - **用原生 arm64 runner，不用 QEMU。** GitHub 的 arm64 托管 runner 已于 2025-08
   [对公开仓库正式可用且免费](https://github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-repositories-are-now-generally-available/)。
-  QEMU 模拟慢且偶发失败。
-  私有仓库拿不到免费 arm runner 时，把仓库变量 `ARM_RUNNER` 设成 `ubuntu-latest`，
-  workflow 里的 QEMU 步骤会自动启用，不用改任何代码。
+  私有仓库把 workflow 里 arm64 那行的 runner 换成 `ubuntu-latest` 并加一步
+  `docker/setup-qemu-action@v3` 即可。
 - **基础镜像 alpine → `python:3.10-slim-bookworm`。** 依赖里只有 `lxml` 是 C 扩展，
   它在 PyPI 上有 amd64/arm64 的 manylinux wheel，走 glibc 完全不需要现场编译。
 - **流水线自带验收。** 合并 manifest 后会 `imagetools inspect` 并断言其中同时存在
-  `linux/amd64` 和 `linux/arm64`，缺一个就让构建失败 —— 不靠"构建成功"去假定架构支持。
+  `linux/amd64` 和 `linux/arm64`，缺一个就让构建失败。
 
 ---
 
@@ -65,7 +64,6 @@ docker compose up -d --build
 | 地址 | 用途 |
 | --- | --- |
 | http://localhost:5050 | 可视化看板 |
-| http://localhost:5050/api/proxies | 看板 API（按国家/城市/协议/延迟筛选） |
 | http://localhost:5010 | proxy_pool 原生 API |
 | http://localhost:5010/get/ | 取一个代理 |
 | `http://localhost:8080` | **轮换代理入口（HTTP）** |
@@ -83,59 +81,66 @@ docker compose up -d --build
 
 ## 架构
 
-两个容器：Redis 一个，proxy_pool + dashboard 合并成的应用一个。
+**职责单一，不重复。** 这一点是踩过坑才定下来的 —— 见下文「为什么不是简单合并」。
 
 ```
-┌─ proxy-redis ────────┐        ┌─ proxy-tool（单容器，8 个进程）──────────────┐
+┌─ proxy-redis ────────┐        ┌─ proxy-tool（单容器，4 个进程）──────────────┐
 │  redis:7-alpine      │        │  tini                                        │
 │                      │        │   └── docker/supervisor.py                   │
-│  DB 0 ← proxy_pool   │◄───────┤        ├── pp-api      :5010  proxy_pool API │
-│  DB 1 ← dashboard    │        │        ├── pp-sched           抓取 + 校验     │
-└──────────────────────┘        │        ├── dash-web    :5050  看板 + 反代     │
-                                │        ├── dash-api    :5051  看板内部 API    │
-                                │        ├── validator          验证 / 淘汰     │
-                                │        ├── quality            质量统计        │
-                                │        ├── bridge             导入代理        │
-                                │        └── gateway    :8080   HTTP 代理入口   │
-                                │                       :1080   SOCKS5 入口     │
+│  DB 0  代理数据       │◄───────┤        ├── pp-api    :5010  原生 API          │
+│  DB 1  geo 缓存       │        │        ├── pp-sched         采集 + 验证       │
+└──────────────────────┘        │        ├── web       :5050  只读展示层        │
+                                │        └── gateway   :8080  HTTP 代理入口     │
+                                │                      :1080  SOCKS5 入口       │
                                 └──────────────────────────────────────────────┘
 ```
 
-两套系统共用一个 Redis 但**分库**：proxy_pool 用 DB 0，看板用 DB 1，互不干扰。
-
-### 镜像内部布局（和仓库布局刻意不同）
-
-| 镜像路径 | 内容 | 为什么必须是这个位置 |
+| 层 | 谁负责 | 说明 |
 | --- | --- | --- |
-| `/app` | 仓库的 `dashboard/` | 上游 `backend.py` 第 9 行写死了 `sys.path.insert(0, "/app")` |
-| `/opt/proxy_pool` | 仓库根目录的 proxy_pool 源码 | **不能和 dashboard 同目录** |
-| `/opt/proxy-tool` | 进程管理器与检查脚本 | — |
+| 数据平面 | proxy_pool | **唯一**写代理数据的地方：采集、验证、淘汰、原生 API |
+| 采集源 | proxy_pool 的 24 个 fetcher | 原有 14 个 + 移植进来的 10 个 GitHub 列表源 |
+| 展示 | `dashboard/web.py` | 只读 DB 0，不写任何代理数据 |
+| 出口 | `dashboard/gateway.py` | 固定入口，逐请求轮换上游 |
 
-那条"不能同目录"是这个合并项目最大的暗坑：两边都有一个叫 `util` 的顶层模块
-（proxy_pool 是 `util/` 包，dashboard 是 ip2region 的 `util.py`），放一起会互相覆盖，
-而且是**静默**覆盖 —— 表现只是地理定位悄悄失效，很难发现。
-`docker/assert_layout.py` 在构建期把这条约束钉死：布局一旦被破坏，构建直接失败。
+Redis 的 DB 0 存代理数据（proxy_pool 的 `use_proxy` hash），DB 1 只被 `geo.py`
+用作地理信息缓存，不是第二个数据平面。
 
-proxy_pool 源码里没有任何绝对路径，所以它可以自由重定位。
+### 为什么不是简单合并
+
+一开始我把两个项目并排跑、用一个 bridge 把数据从 proxy_pool 复制给看板。
+后来核实发现这么做几乎没有收益：
+
+**proxy-pool-dashboard 不是 proxy_pool 的前端，而是一套完整独立的代理池** ——
+它有自己的采集器（23 源）、验证器、存储 schema、API 和 UI。它对 proxy_pool 的引用
+只有 `backend.py` 里一处 `jhao_map()`，整段包在 `try/except` 里，读不到就返回空；
+而且只给已存在于自己库里的代理补三个字段，从不新增代理。
+
+更致命的是**质量策略冲突**：proxy_pool 没有延迟门槛，只要 10s 内有响应就留；
+而看板的验证器会把 **≥500ms 的直接删掉**。所以从 proxy_pool 复制过去的代理，
+30 秒内绝大部分就被清掉了，proxy_pool 那 10 秒超时的验证工作也全是白做的。
+
+（同一作者还有第三个仓库 `proxy-pool-tools`，README 写着「完整代理池 =
+proxy_pool + dashboard + 本工具集」，但那个工具集全程用 SQLite、
+`DB_PATH` 甚至硬编码成作者本机路径，与前两者的 Redis 完全不通。）
+
+所以现在的做法是：**只保留一套数据平面**（proxy_pool，成熟、有测试、MIT 许可），
+把看板降级为纯展示层，把对方最有价值的资产（GitHub 代理列表源）移植进
+proxy_pool 的 fetcher 框架。看板自带的采集器、验证器、质量统计、bridge 全部删除。
 
 ### 进程管理
 
-容器里用 `docker/supervisor.py` 统一管这 8 个进程，而不是沿用上游各自的启动方式：
+容器里用 `docker/supervisor.py` 统一管这 4 个进程，而不是沿用上游各自的启动方式：
 
-- proxy_pool 的 `proxy_pool.sh` 只是拉起 `proxyPool.py server` 和 `schedule` 两个进程，
+- proxy_pool 的 `proxy_pool.sh` 只是拉起 `proxyPool.py server` 和 `schedule`，
   这里直接调这两个 click 子命令，脚本和它的 bash 依赖都不需要了。
-- dashboard 的 `dashboard.py` 是它自己的看门狗，只管它那 4 个进程。合并后由
-  supervisor 统一接管；`dashboard.py` 保留在仓库里（单独跑看板时仍可用），容器不会用到。
+- 看板原来的看门狗 `dashboard.py` 已随其采集/验证进程一并删除。
 
 supervisor 提供的额外好处：
 
-- 给每个进程的输出加 `[名字]` 前缀再转发到容器 stdout ——
-  否则 8 个进程的日志混在一起没法排查
+- 给每个进程的输出加 `[名字]` 前缀再转发到容器 stdout
 - 崩溃后指数退避重启（2s→4s→…→60s 上限，稳定 120s 后重置）
 - SIGTERM/SIGINT 时优雅停机，连子进程派生的孙进程一起清掉
 - 启动前自检脚本和离线库是否就位，缺了立刻报错而不是运行时静默降级
-
-看日志与状态：
 
 ```bash
 docker compose logs -f proxy-tool
@@ -144,38 +149,41 @@ docker compose logs -f proxy-tool | grep '^\[gateway\]'   # 只看网关
 
 ---
 
-## 两个自研组件
+## gateway —— 固定入口的轮换代理
 
-### bridge —— 让 proxy_pool 的代理出现在看板里
+代理池里的 IP 一直在变，业务侧不想每次都去调 API 换地址。没有网关时每个调用方都得
+自己写一遍取用—重试—上报：
 
-看板的 `backend.py` 本来就会读 proxy_pool 在 DB 0 的 `use_proxy` 哈希做字段补全
-（`jhao_map()`），但那只对**已经存在于 DB 1 池子里**的成员生效。
-也就是说 proxy_pool 抓到的代理默认根本进不了看板。
+```python
+proxy = requests.get("http://proxy-tool:5010/get/").json()["proxy"]
+try:
+    r = requests.get(url, proxies={"http": f"http://{proxy}"}, timeout=10)
+except Exception:
+    requests.get(f"http://proxy-tool:5010/delete/?proxy={proxy}")
+    # 重试逻辑自己写…
+```
 
-`bridge.py` 补的就是这一段：周期性 `GET {PROXY_API}/all/`，把新代理写进 DB 1，
-之后交给看板自己的 validator 去验证、定位、淘汰。它只插入不存在的条目，
-**不会覆盖** validator 已写好的 latency / country / 信用分，也不会调用 proxy_pool 的
-`/delete/`，因此对上游池子完全只读。
-
-> 看板的 validator 策略是"只留 <500ms"，所以从 proxy_pool 导入的慢代理会在下一轮
-> 验证时被清掉。这是看板的既有设计，不是 bug。
-
-### gateway —— 固定入口的轮换代理
-
-代理池里的 IP 一直在变，业务侧不想每次都去调 API 换地址。gateway 提供一个稳定入口，
-每条连接自动从池子里挑一个可用上游转发，失败自动换下一个：
+有网关时地址固定不变，业务代码零改动：
 
 ```bash
-curl -x http://localhost:8080  https://httpbin.org/ip
-curl -x socks5h://localhost:1080 https://httpbin.org/ip
+export http_proxy=http://proxy-tool:8080
+curl https://target.com
 
-export http_proxy=http://localhost:8080 https_proxy=http://localhost:8080
+curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 ```
 
 - 入口协议：HTTP（含 `CONNECT` 隧道，所以 HTTPS 也走得通）、SOCKS5
-- 上游协议：http / https / socks4 / socks4a / socks5 / socks5h
-- 选取策略：按实测延迟排序取最快的一批，逐请求随机轮换
-- 失败处理：连续失败达阈值后临时拉黑（默认 2 次 / 冷却 300s），不写回上游池子
+- 选取策略：按实测延迟排序取最快的一批，逐请求随机轮换；延迟未知的排在最后
+- 失败处理：自动换下一个上游，连续失败达阈值后临时拉黑（默认 2 次 / 冷却 300s）
+- 上游来源默认直读 Redis（比走 API 少一跳，且能拿到延迟）
+
+**适用与不适用：** 它适合无状态的批量请求，以及那些你改不了代码的工具
+（curl、浏览器、只支持 SOCKS 的客户端）。如果需要「同一个会话固定用同一个出口 IP」
+（维持登录态、购物车、分页会话），那就直接调 `/get/` 拿一个代理在该会话里一直用、
+绕过网关 —— 两种用法并行不冲突。
+
+另外要清楚它的代价：所有流量过一个进程，是吞吐瓶颈也是单点；它也隐藏了实际出口 IP，
+排查问题时不够直观。
 
 > ### ⚠️ 安全提示
 > `GATEWAY_USER` / `GATEWAY_PASS` 默认为空，此时 8080 和 1080 是**无鉴权的开放代理**。
@@ -188,36 +196,35 @@ export http_proxy=http://localhost:8080 https_proxy=http://localhost:8080
 
 ## 配置
 
-`DB_CONN`、`PROXY_API`、`PYTHONUNBUFFERED`、`REDIS_HOST` 这些默认值全部写在镜像的
-`ENV` 里，开箱可用 —— Redis 的默认地址就是 `redis`，正好等于 compose 里的服务名。
-需要调整时在 compose 的 `proxy-tool` 服务下加 `environment:` 即可。
-
-compose 里显式声明的只有三件必要的事，都不是可调参数：
-
-| 配置 | 为什么必须有 |
-| --- | --- |
-| `NO_PROXY` / `no_proxy` | 宿主机 `~/.docker/config.json` 若配了 `proxies`（为拉镜像走代理，很常见），Docker 会自动把 `HTTP_PROXY` 注入容器。而看板的 `frontend.py` 是用 urllib 默认 opener 把 `/api/*` 反代到 `127.0.0.1:5051` 的，届时这个内部请求会被送去外部代理，看板 API 直接 502。大小写两份都要给，因为 urllib 和 requests 读的变量名大小写不一致 |
-| `logging` 轮转 | 容器里 8 个进程一直在打日志（validator 每 30s 一轮），不轮转会吃满磁盘 |
-| `stop_grace_period: 30s` | `docker stop` 默认只等 10s。supervisor 停机上界约 `STOP_TIMEOUT + 进程数×1s`；实测最坏情况（8 个子进程全部忽略 SIGTERM）为 10.8s，30s 有充足余量 |
-
-另外 compose 没有显式声明 `networks` —— compose 会自动建一个项目专属网络，
-功能与手写 `proxy-net` 完全等价。别的 compose 项目要接进来的话：
-
-```yaml
-networks:
-  default:
-    name: proxy-tool_default
-    external: true
-```
+默认值全部写在镜像的 `ENV` 里，开箱可用。需要调整时在 compose 的 `proxy-tool`
+服务下加 `environment:` 即可。
 
 ### 服务开关
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `SVC_PROXY_POOL` | `1` | proxy_pool 的 API 与调度进程 |
-| `SVC_DASHBOARD` | `1` | 看板的 4 个进程 |
-| `SVC_BRIDGE` | `1` | 代理导入（`PROXY_API` 为空时自动不启用） |
+| `SVC_PROXY_POOL` | `1` | 采集 + 验证 + 原生 API |
+| `SVC_WEB` | `1` | 展示层 |
 | `SVC_GATEWAY` | `1` | 8080 / 1080 轮换代理 |
+
+### 采集与验证吞吐（重要）
+
+移植进来的 GitHub 列表源加起来有一万多条，而且绝大多数是死的。
+proxy_pool 的调度是**每 5 分钟采集一轮、每 2 分钟全量复检**，
+若不限流，单轮验证要跑一个多小时，远超调度间隔，任务会不断堆叠直到把池子拖死。
+
+所以每个 GitHub 源每轮只随机取 `GITHUB_FETCH_LIMIT` 条（默认 150，10 个源共约 1500 条）。
+随机采样能让多轮下来覆盖整个列表，而不是每次都盯着开头几条。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `GITHUB_FETCH_LIMIT` | `150` | 每个 GitHub 源每轮的取样上限，`0` = 不限 |
+| `PROXY_CHECK_THREADS` | `20` | 校验线程数（上游写死 20，本项目改为可配） |
+| `VERIFY_TIMEOUT` | `10` | 单个代理的校验超时（秒），调小能显著提升吞吐 |
+
+粗算：1500 条 × 均摊 3s ÷ 20 线程 ≈ 225s，刚好落在 5 分钟的采集间隔内。
+想放大源规模就同时调大前两项，或把 `VERIFY_TIMEOUT` 降到 5。
+日志里 `ProxyCheck` 迟迟不 `complete` 就是没跑完的信号。
 
 ### Redis
 
@@ -226,24 +233,22 @@ networks:
 | `REDIS_HOST` | `redis` | 等于 compose 里的服务名 |
 | `REDIS_PORT` | `6379` | |
 | `REDIS_PASSWORD` | 空 | 有则用于拼 `DB_CONN` |
-| `REDIS_DB` | `1` | 看板用的库号（proxy_pool 固定用 0） |
-| `DB_CONN` | 由上面几项推导 | proxy_pool 的库地址，一般不用手动设 |
+| `PROXY_POOL_DB` | `0` | 代理数据所在库（DB 1 是 geo 缓存） |
+| `DB_CONN` | 由上面几项推导 | 一般不用手动设 |
 
 ### 网关
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_USER` / `GATEWAY_PASS` | 空 | 客户端鉴权。**留空 = 开放代理** |
-| `GATEWAY_SOURCE` | `redis,api` | 上游来源，可选 `redis` / `api` / `static` |
+| `GATEWAY_SOURCE` | `redis` | 上游来源，可选 `redis` / `api` / `static` |
 | `GATEWAY_TOP_N` | `200` | 候选池保留最快的 N 个 |
 | `GATEWAY_MAX_RETRIES` | `3` | 单次请求最多尝试几个上游 |
 | `GATEWAY_FAIL_THRESHOLD` | `2` | 连续失败几次后拉黑 |
 | `GATEWAY_COOLDOWN` | `300` | 拉黑时长（秒） |
 
-完整清单见 `dashboard/gateway.py` 与 `dashboard/bridge.py` 的模块头注释。
-
-proxy_pool 沿用上游的环境变量覆盖机制（`handler/configHandler.py`），
-`HTTP_URL`、`VERIFY_TIMEOUT`、`POOL_SIZE_MIN` 等都可覆盖 `setting.py` 里的同名配置。
+完整清单见 `dashboard/gateway.py` 与 `dashboard/web.py` 的模块头注释。
+proxy_pool 侧沿用上游的环境变量覆盖机制（`handler/configHandler.py`）。
 
 ---
 
@@ -254,36 +259,38 @@ proxy_pool 沿用上游的环境变量覆盖机制（`handler/configHandler.py`�
 | 改动 | 原因 |
 | --- | --- |
 | workflow 重写为多架构，合并成一个文件发 GHCR | 上游只出 amd64（**本项目要解决的核心问题**） |
-| 两个项目合并为单镜像单容器 | 部署简化 |
+| 合并为单镜像单容器 | 部署简化 |
 | 基础镜像 alpine → Debian slim | glibc/manylinux 有现成 aarch64 wheel，跨架构免编译 |
 | 不再使用 `proxy_pool.sh` | 直接调 `proxyPool.py` 的子命令，摆脱 bash 依赖 |
-| 改为多阶段构建 | 编译器只留在 builder 阶段 |
-| 以非 root（`10001:10001`）运行 | 最小权限 |
-| 加 `HEALTHCHECK` | 让 compose 的 `depends_on: service_healthy` 可用 |
+| 多阶段构建、非 root（`10001:10001`）运行、内置 `HEALTHCHECK` | 体积、权限、编排 |
 
-### 对上游源码的修改
+### 对 proxy_pool 的改动
 
-**proxy_pool 的源码零修改。** dashboard 改了 3 个文件：
-
-| 文件 | 改动 | 影响 |
+| 文件 | 改动 | 原因 |
 | --- | --- | --- |
-| `dashboard/searcher.py` | `import ip2region.util as util` → `import util` | 仓库里并没有 `ip2region` 这个包，原样保留会让 `import searcher` 抛 `ModuleNotFoundError`，被 `new_fetcher.py` 的 try/except 吞掉 —— ip2region 离线兜底**从未真正生效**过 |
-| `dashboard/new_fetcher.py` | xdb 路径 `/app/ip2region.xdb` → 用 `__file__` 拼出 `data/ip2region.xdb` | 同上，上游写的是一个不存在的路径 |
-| `dashboard/requirements.txt` | `redis>=5.0` → `redis==5.2.1` | 锁版本，保证多架构构建可复现 |
+| `helper/proxy.py`、`helper/check.py` | 新增 `latency` 字段并在校验时计时 | 上游完全不记录延迟，导致看板的延迟列/排序/筛选和网关的择优都无从实现。校验本身就是一次真实代理请求，顺手计时即可 |
+| `fetcher/sources/github_lists.py` | 新增 10 个 GitHub 列表源 | 移植 dashboard/tools 最有价值的资产到成熟框架里。只收 HTTP/HTTPS 源：proxy_pool 的校验器验不了 SOCKS，导进来只会全部失败被删 |
+| `setting.py`、`handler/configHandler.py`、`helper/check.py` | 校验线程数改为可配 | 上游写死 20，源规模变大后需要能调 |
 
-修复后已实测：`114.114.114.114` → `中国|江苏省|南京市|0|CN`。
-这条链路现在由 `docker/assert_layout.py` 在构建期和 CI 里各验证一次，不会再悄悄坏掉。
+上游列表里 `mertguvencli/http-proxy-list` 与 `mmpx12/proxy-list` 的 raw 路径实测已 404，
+未收录。
 
-另外删掉了上游 dashboard 的 `server.py`（一个 11 行的临时静态文件服务，与本项目无关）
-和两份各自的 `Dockerfile` / `docker-compose.yml`（已被合并方案取代）。
+### 对 dashboard 的改动
 
-### 新增
+删除了 9 个文件（`backend.py`、`frontend.py`、`validator.py`、`quality.py`、
+`new_fetcher.py`、`searcher.py`、`util.py`、`dashboard.py`、`bridge.py`）
+和 10MB 的 `data/ip2region.xdb` —— 它们构成的那套采集/验证/存储与 proxy_pool 完全重复。
+目录体积从 14MB 降到 3.5MB。
 
-- `dashboard/bridge.py` — proxy_pool → 看板的代理导入
-- `dashboard/gateway.py` — HTTP / SOCKS5 轮换代理入口
-- `docker/supervisor.py` — 容器内 8 进程管理
-- `docker/assert_layout.py` — 布局断言（构建期 + CI）
-- `docker/healthcheck.sh` — 按服务开关做健康检查
+保留 `geo.py`（GeoIP，含离线库 `data/ipdb.bin`）与 `static/`（前端 SPA），
+新增 `web.py`（只读展示层，同时托管静态文件）和 `gateway.py`（轮换网关）。
+
+顺带修掉一个上游缺陷：`searcher.py` 里 `import ip2region.util as util` 引用了一个
+仓库中并不存在的包，导致 ip2region 离线兜底**从未生效**过。随着 `new_fetcher.py`
+一并删除，这条死链路和它带来的模块同名冲突都不存在了。
+
+前端两处已不成立的描述也已修正：状态栏不再宣称「仅展示 <500ms」，
+协议筛选不再列出 proxy_pool 根本不会产出的 socks4/socks5。
 
 ---
 
@@ -296,27 +303,25 @@ proxy_pool 沿用上游的环境变量覆盖机制（`handler/configHandler.py`�
 ├── docker-compose.yml          # 两个容器：redis + proxy-tool
 ├── docker/
 │   ├── supervisor.py           # 容器内进程管理
-│   ├── assert_layout.py        # 布局断言，Dockerfile 与 CI 共用
+│   ├── assert_layout.py        # 构建期自检，Dockerfile 与 CI 共用
 │   └── healthcheck.sh
-├── api/ db/ fetcher/ handler/ helper/ util/    # proxy_pool 源码（零修改）
+├── api/ db/ fetcher/ handler/ helper/ util/    # proxy_pool 源码
+│   └── fetcher/sources/github_lists.py         #   └─ 新增的 GitHub 列表源
 ├── proxyPool.py  setting.py  requirements.txt
 ├── proxy_pool.sh               # 上游的启动脚本，容器不用，保留供本地直接运行
 ├── tests/                      # proxy_pool 测试（248 例）
 ├── docs/                       # proxy_pool 的 mkdocs 文档
 └── dashboard/
-    ├── frontend.py backend.py validator.py quality.py geo.py new_fetcher.py
-    ├── searcher.py util.py     # ip2region 离线库读取（Apache-2.0）
-    ├── dashboard.py            # 上游自带的看门狗，容器不用
-    ├── bridge.py gateway.py    # 自研
-    ├── data/                   # 离线 GeoIP 库，运行必需，勿加入 .gitignore
-    └── static/                 # 看板前端
+    ├── web.py                  # 只读展示层（自研）
+    ├── gateway.py              # 轮换代理网关（自研）
+    ├── geo.py                  # GeoIP（上游）
+    ├── data/ipdb.bin           # 离线 GeoIP 库，运行必需
+    └── static/                 # 前端 SPA（上游）
 ```
 
 ---
 
 ## 本地校验
-
-推之前可以先自查：
 
 ```bash
 hadolint Dockerfile
@@ -327,8 +332,8 @@ docker compose config -q
 pip install -r requirements.txt -r requirements-test.txt -r dashboard/requirements.txt
 pytest -q
 
-cd dashboard && python ../docker/assert_layout.py dashboard && cd ..
 python docker/assert_layout.py proxy_pool
+cd dashboard && python ../docker/assert_layout.py web
 ```
 
 ---
@@ -337,13 +342,13 @@ python docker/assert_layout.py proxy_pool
 
 - **proxy_pool** — MIT License，Copyright (c) 2017 J_hao104。见 [`LICENSE`](LICENSE)。
 - **proxy-pool-dashboard** — 上游仓库**未声明许可证**，默认即保留所有权利。
-  自用没问题；若要公开分发或商用，建议先联系原作者确认授权。
-- **ip2region**（`dashboard/searcher.py`、`dashboard/util.py`）— Apache-2.0，
-  Copyright 2022 The Ip2Region Authors。
-- `dashboard/data/ipdb.bin` 源自 DB-IP Country Lite，`dashboard/data/ip2region.xdb`
-  源自 ip2region，各自适用其原始许可条款。
+  本项目保留其 `geo.py` 与 `static/`。自用没问题；若要公开分发或商用，
+  建议先联系原作者确认授权。
+- `dashboard/data/ipdb.bin` 源自 DB-IP Country Lite，适用其原始许可条款。
+- GitHub 代理列表源的 URL 清单参考了 `abclq/proxy-pool-tools`。
 
-本项目新增的 `bridge.py`、`gateway.py`、`docker/` 下的脚本、workflow 与容器化配置遵循 MIT。
+本项目新增的 `web.py`、`gateway.py`、`docker/` 下的脚本、`github_lists.py`、
+workflow 与容器化配置遵循 MIT。
 
 ## 免责声明
 

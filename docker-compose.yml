@@ -1,14 +1,14 @@
 name: proxy-tool
 
-# 两个容器：Redis 一个，proxy_pool + dashboard 合并成的应用一个。
+# 两个容器：Redis 一个，proxy_pool + 展示层 + 网关合并成的应用一个。
 #
 #   本地构建启动：  docker compose up -d --build
 #   用已发布镜像：  docker compose pull && docker compose up -d
 #                  （需要先把下面 image 里的 OWNER 换成你的 GitHub 用户名）
 #
-# 端口：5010 proxy_pool API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
+# 端口：5010 proxy_pool 原生 API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
 #
-# 其余配置（DB_CONN、PROXY_API、PYTHONUNBUFFERED 等）都已内置在镜像的 ENV 里，
+# 其余配置（DB_CONN、PROXY_API、PROXY_POOL_DB 等）都已内置在镜像的 ENV 里，
 # 默认值开箱即用，所以这里不用重复声明。
 
 services:
@@ -28,7 +28,8 @@ services:
         max-file: '2'
 
   proxy-tool:
-    image: ghcr.io/ownercm/proxy-tool:latest
+    image: ghcr.io/OWNER/proxy-tool:latest
+    build: .
     container_name: proxy-tool
     restart: unless-stopped
     ports:
@@ -38,13 +39,12 @@ services:
       - '1080:1080'
     environment:
       # 必须保留。如果宿主机的 ~/.docker/config.json 里配了 proxies（为了拉镜像走代理，
-      # 很常见），Docker 会自动把 HTTP_PROXY 注入容器；而看板的 frontend.py 是用
-      # urllib 默认 opener 把 /api/* 反代到 127.0.0.1:5051 的，届时这个内部请求会被
-      # 送去外部代理，看板 API 直接 502。NO_PROXY 就是来兜这个的。
+      # 很常见），Docker 会自动把 HTTP_PROXY 注入容器，届时访问本机 Redis 与
+      # proxy_pool 的内部请求会被送去外部代理而失败。
       # 大小写两份都要给：urllib 与 requests 读取的变量名大小写不一致。
       NO_PROXY: 'localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool'
       no_proxy: 'localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool'
-      # 如果你不希望采集器和 GeoIP 查询走宿主机的代理，把下面四行的注释去掉。
+      # 如果不希望采集器和 GeoIP 查询走宿主机的代理，把下面四行的注释去掉。
       # 反过来说，国内环境访问 GitHub 上的代理源列表时，保留代理往往更好用。
       #HTTP_PROXY: ''
       #HTTPS_PROXY: ''
@@ -53,8 +53,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # docker stop 默认只等 10s，而容器里有 8 个进程要收尾（supervisor 的停机
-    # 上界约为 STOP_TIMEOUT + 进程数×1s ≈ 18s）。给足余量，避免收尾被 SIGKILL 打断。
+    # docker stop 默认只等 10s，而容器里有几个进程要收尾（supervisor 的停机上界
+    # 约为 STOP_TIMEOUT + 进程数×1s）。给足余量，避免收尾被 SIGKILL 打断。
     stop_grace_period: 30s
     logging:
       driver: 'json-file'

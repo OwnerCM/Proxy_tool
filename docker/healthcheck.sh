@@ -13,13 +13,13 @@ enabled() {
 }
 
 if enabled "${SVC_PROXY_POOL:-}" 1; then
-    curl -fsS --max-time 5 "http://127.0.0.1:${PROXY_POOL_PORT:-5010}/count/" >/dev/null \
+    curl -fsS --max-time 5 "http://127.0.0.1:${PORT:-5010}/count/" >/dev/null \
         || { echo "proxy_pool API 无响应"; exit 1; }
 fi
 
-if enabled "${SVC_DASHBOARD:-}" 1; then
-    curl -fsS --max-time 5 "http://127.0.0.1:${DASHBOARD_PORT:-5050}/api/stats" >/dev/null \
-        || { echo "dashboard 无响应"; exit 1; }
+if enabled "${SVC_WEB:-${SVC_DASHBOARD:-}}" 1; then
+    curl -fsS --max-time 10 "http://127.0.0.1:${WEB_PORT:-5050}/api/stats" >/dev/null \
+        || { echo "展示层无响应"; exit 1; }
 fi
 
 exit 0

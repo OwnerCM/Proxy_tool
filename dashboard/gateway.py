@@ -9,9 +9,12 @@ gateway 提供一个稳定的本地入口，每条连接自动从池子里挑一
 失败自动换下一个。
 
 上游来源（可叠加，见 GATEWAY_SOURCE）：
-  redis   dashboard 自己的 Redis 池（DB 1，已被 validator 验证过 <500ms，量大质优）
-  api     proxy_pool 的 HTTP API（GET {PROXY_API}/all/）
-  static  GATEWAY_STATIC_PROXIES 里手工指定的固定列表
+  redis   直读 proxy_pool 的库（DB 0 的 hash），默认来源。少一次 HTTP 往返，
+          且能拿到 latency 用于优先选快的上游
+  api     走 proxy_pool 的 HTTP API（GET {PROXY_API}/all/）。数据与 redis 来源相同，
+          适合 gateway 与 proxy_pool 不在同一台 Redis 旁边的部署
+  static  GATEWAY_STATIC_PROXIES 里手工指定的固定列表。proxy_pool 只采 HTTP 代理，
+          想接入自备的 SOCKS 上游就用这个
 
 支持的上游协议：http / https（HTTP CONNECT 隧道）、socks5 / socks5h、socks4 / socks4a。
 
@@ -22,7 +25,7 @@ gateway 提供一个稳定的本地入口，每条连接自动从池子里挑一
 环境变量
 --------
 GATEWAY_ENABLED         1/0，默认 1
-GATEWAY_SOURCE          上游来源，逗号分隔，默认 "redis,api"
+GATEWAY_SOURCE          上游来源，逗号分隔，默认 "redis"
 GATEWAY_HTTP_PORT       HTTP 代理监听端口，默认 8080；设为 0 关闭
 GATEWAY_SOCKS_PORT      SOCKS5 监听端口，默认 1080；设为 0 关闭
 GATEWAY_BIND            监听地址，默认 0.0.0.0
@@ -38,7 +41,9 @@ GATEWAY_FAIL_THRESHOLD  连续失败几次后临时拉黑，默认 2
 GATEWAY_COOLDOWN        拉黑时长秒数，默认 300
 GATEWAY_STATIC_PROXIES  固定上游，格式 "host:port:proto,host:port:proto"
 PROXY_API               proxy_pool API 根地址，source 含 api 时必需
-REDIS_HOST/PORT/DB      Redis 连接，默认 redis / 6379 / 1
+REDIS_HOST/PORT         Redis 连接，默认 redis / 6379
+PROXY_POOL_DB           proxy_pool 的库号，默认 0
+TABLE_NAME              proxy_pool 的 hash 名，默认 use_proxy
 """
 
 import base64
@@ -55,8 +60,8 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-KEY_POOL = "proxies:pool"
-PFX_PROXY = "proxy:"
+# proxy_pool 在 Redis 里的 hash 名，与 setting.py 的 TABLE_NAME 对应
+TABLE_NAME = os.environ.get("TABLE_NAME", "use_proxy")
 
 # 未知延迟按最差处理，保证有实测数据的上游优先被选中
 UNKNOWN_LATENCY = 9999
@@ -77,7 +82,7 @@ def _env_int(name, default):
 
 
 ENABLED = os.environ.get("GATEWAY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "")
-SOURCES = [s.strip().lower() for s in os.environ.get("GATEWAY_SOURCE", "redis,api").split(",") if s.strip()]
+SOURCES = [s.strip().lower() for s in os.environ.get("GATEWAY_SOURCE", "redis").split(",") if s.strip()]
 HTTP_PORT = _env_int("GATEWAY_HTTP_PORT", 8080)
 SOCKS_PORT = _env_int("GATEWAY_SOCKS_PORT", 1080)
 BIND = os.environ.get("GATEWAY_BIND", "0.0.0.0")
@@ -95,7 +100,7 @@ STATIC_PROXIES = os.environ.get("GATEWAY_STATIC_PROXIES", "")
 PROXY_API = os.environ.get("PROXY_API", "").strip().rstrip("/")
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = _env_int("REDIS_PORT", 6379)
-REDIS_DB = _env_int("REDIS_DB", 1)
+PROXY_POOL_DB = _env_int("PROXY_POOL_DB", 0)
 
 
 def log(msg):
@@ -160,33 +165,37 @@ class UpstreamPool:
             import redis  # 延迟导入：source 不含 redis 时无需该依赖
 
             self._redis = redis.Redis(
-                host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                host=REDIS_HOST, port=REDIS_PORT, db=PROXY_POOL_DB,
                 decode_responses=True, socket_connect_timeout=5, socket_timeout=5,
             )
         return self._redis
 
     def _load_redis(self):
-        r = self._redis_client()
-        # 按信用分从高到低取，限制扫描量，避免池子上万时每轮都全量 hgetall
-        members = r.zrevrange(KEY_POOL, 0, POOL_SCAN - 1)
-        if not members:
-            return []
-        pipe = r.pipeline(transaction=False)
-        for member in members:
-            pipe.hgetall(f"{PFX_PROXY}{member}")
-        rows = pipe.execute()
+        """直读 proxy_pool 的库（DB 0 的 hash，field=ip:port，value=Proxy.to_json）。
 
+        比走 api 来源少一次 HTTP 往返，而且能拿到 latency 用于择优。
+        POOL_SCAN 只是一道安全上限：proxy_pool 的 MAX_FAIL_COUNT 默认为 0，
+        失败即删，池子里基本都是可用代理，量级不大。
+        """
+        r = self._redis_client()
         out = []
-        for member, row in zip(members, rows):
-            row = row or {}
-            host, _, port = member.rpartition(":")
+        for field, value in r.hscan_iter(TABLE_NAME, count=1000):
+            try:
+                data = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            proxy = str(data.get("proxy") or field or "")
+            host, _, port = proxy.rpartition(":")
             if not port.isdigit():
                 continue
             port = int(port)
             if not _valid_endpoint(host, port):
                 continue
-            out.append(Upstream(host, port, _normalize_proto(row.get("protocol")),
-                                _parse_latency(row.get("latency"))))
+            # proxy_pool 只收 HTTP 代理（它的校验器验不了 socks），
+            # https 位表示该代理支持 CONNECT，对拨号方式而言仍是 http 类上游
+            out.append(Upstream(host, port, "http", _parse_latency(data.get("latency"))))
+            if len(out) >= POOL_SCAN:
+                break
         return out
 
     def _load_api(self):

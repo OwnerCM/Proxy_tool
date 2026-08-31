@@ -1,23 +1,17 @@
 # syntax=docker/dockerfile:1.7
 #
-# 合并镜像：proxy_pool + dashboard + 内置 Redis，一个镜像跑一个容器。
+# 合并镜像：proxy_pool（数据平面）+ 展示层 + 轮换网关，一个镜像跑一个容器。
+# Redis 是独立容器，见 docker-compose.yml。
 # 多架构：linux/amd64 + linux/arm64
 #
-# ── 镜像内部布局（刻意与仓库布局不同，原因如下）──
+# ── 镜像内部布局 ──
+#   /opt/proxy_pool   ← 仓库根目录的 proxy_pool 源码（采集 + 验证 + 原生 API）
+#   /app              ← 仓库的 dashboard/（只读展示层 + 网关）
+#   /opt/proxy-tool   ← 进程管理器、健康检查、构建期自检脚本
 #
-#   /app              ← 仓库的 dashboard/
-#         上游 dashboard/backend.py 第 9 行写死了 sys.path.insert(0, "/app")，
-#         所以 dashboard 必须正好落在 /app，否则它自己的模块会找不到。
-#
-#   /opt/proxy_pool   ← 仓库根目录的 proxy_pool 源码
-#         不能和 dashboard 放同一个目录：两边都有名为 util 的顶层模块
-#         （proxy_pool 是 util/ 包，dashboard 是 ip2region 的 util.py），
-#         同目录会互相覆盖，且 ip2region 会静默失效。
-#         proxy_pool 源码里没有任何绝对路径，可以自由重定位。
-#         下面有构建期断言来锁死这条约束。
-#
-#   /opt/proxy-tool   ← 进程管理器与健康检查脚本
-#   /data             ← 内置 Redis 的落盘目录
+#   两份代码分开放而不是塞进同一目录，是因为各自都以自己的目录为 cwd 运行
+#   （Python 会把脚本所在目录放到 sys.path 首位），分开能避免任何同名模块互相遮蔽。
+#   proxy_pool 源码里没有绝对路径，可以自由重定位。
 #
 # ── 与上游 jhao104/proxy_pool 镜像的差异 ──
 #   1. 基础镜像 python:3.10-alpine → python:3.10-slim-bookworm。
@@ -50,11 +44,11 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /tmp/build
-# 两份 requirements 直接一起装：proxy_pool 声明 redis>=4.2.0、dashboard 声明
-# redis==5.2.1，pip 解析后取 5.2.1，无冲突（已用 --dry-run 验证）。
+# 两份 requirements 一起装：proxy_pool 声明 redis>=4.2.0、展示层声明 redis==5.2.1，
+# pip 解析后取 5.2.1，无冲突（已用 --dry-run 验证）。
 COPY requirements.txt ./requirements.txt
-COPY dashboard/requirements.txt ./requirements-dashboard.txt
-RUN pip install -r requirements.txt -r requirements-dashboard.txt
+COPY dashboard/requirements.txt ./requirements-web.txt
+RUN pip install -r requirements.txt -r requirements-web.txt
 
 # ══════════ runtime ══════════
 FROM python:3.10-slim-bookworm
@@ -68,7 +62,6 @@ LABEL org.opencontainers.image.title="proxy-tool" \
 # tini -> PID 1，负责信号转发与回收孤儿进程
 # curl -> HEALTHCHECK
 # libxml2/libxslt1.1 -> 仅在 lxml 退化为源码编译时才需要的动态库（很小，作为兜底）
-# Redis 不装在这个镜像里，它作为独立容器运行（见 docker-compose.yml）
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -103,19 +96,19 @@ COPY helper/ ./helper/
 COPY util/ ./util/
 COPY proxyPool.py setting.py ./
 
-# ── 构建期断言：把上面那些布局约束真正锁死 ──
-# 手动更新上游代码后，如果结构变了导致这些前提不成立，构建会直接失败，
-# 而不是等到运行时才静默降级（ip2region 兜底失效就是这么被藏了很久的）。
+# ── 构建期自检 ──
+# 改了代码之后如果前提不成立（采集源没被发现、Proxy 少了 latency 字段、
+# 离线 GeoIP 库损坏、静态资源缺失），构建会直接失败，
+# 而不是等到运行时才静默降级 —— ip2region 那条链路就是这么被藏了很久的。
 #
-# 这里必须用 cd 而不是 WORKDIR（DL3003）：断言的核心就是"同一个 python 在不同 cwd 下
-# import util 会解析到不同文件"，需要在一条 RUN 里切换两次目录，WORKDIR 做不到。
+# 两个自检要在各自的代码目录下跑，需要在一条 RUN 里切换目录，WORKDIR 做不到。
 # hadolint ignore=DL3003
 RUN set -eux; \
     cd /opt/proxy_pool; \
     python proxyPool.py --help > /dev/null; \
     python /opt/proxy-tool/assert_layout.py proxy_pool; \
     cd /app; \
-    python /opt/proxy-tool/assert_layout.py dashboard; \
+    python /opt/proxy-tool/assert_layout.py web; \
     python -m compileall -q /app /opt/proxy_pool /opt/proxy-tool
 
 # ── 运行账户与可写目录 ──
@@ -130,20 +123,22 @@ RUN groupadd --gid 10001 app \
 USER 10001:10001
 
 # ── 默认配置 ──
-# 全部通过 ENV 提供，好处是 docker exec 进去手动跑脚本时也能拿到一致的配置，
-# 不必依赖各上游模块里五花八门的默认值（dashboard 各模块的默认值并不一致）。
+# 全部通过 ENV 提供，好处是 docker exec 进去手动跑脚本时也能拿到一致的配置。
+#
 # REDIS_HOST 默认取 "redis"，正好等于 docker-compose.yml 里 Redis 的服务名，
 # 所以 compose 那边一行 environment 都不用写。
 # 独立 docker run 时按需覆盖：-e REDIS_HOST=<你的 redis 地址>
 #
-# PROXY_API 指向 127.0.0.1 是对的 —— proxy_pool 和看板现在同在一个容器里。
-# NO_PROXY 是必须的：看板的 frontend.py 用 urllib 默认 opener 把 /api/* 反代到
-# 127.0.0.1:5051，一旦容器里存在 HTTP_PROXY（Docker 会把宿主机 ~/.docker/config.json
-# 里的 proxies 自动注入容器），这个内部请求就会被送去外部代理，看板 API 直接 502。
-# 大小写两份都给：urllib 与 requests 读取的变量名大小写不一致。
+# PROXY_POOL_DB=0 是代理数据所在的库；DB 1 只被 geo.py 用作地理缓存。
+# PROXY_API 指向 127.0.0.1 是对的 —— proxy_pool 和展示层同在一个容器里。
+#
+# NO_PROXY 是必须的：容器里一旦存在 HTTP_PROXY（Docker 会把宿主机
+# ~/.docker/config.json 里的 proxies 自动注入），访问本机 Redis 与 proxy_pool
+# 的请求就会被送去外部代理而失败。大小写两份都给：urllib 与 requests
+# 读取的变量名大小写不一致。
 ENV REDIS_HOST=redis \
     REDIS_PORT=6379 \
-    REDIS_DB=1 \
+    PROXY_POOL_DB=0 \
     PROXY_API=http://127.0.0.1:5010 \
     NO_PROXY=localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool \
     no_proxy=localhost,127.0.0.1,::1,redis,proxy-redis,proxy-tool
@@ -152,8 +147,7 @@ ENV REDIS_HOST=redis \
 # 它由 supervisor.py 从 REDIS_HOST/REDIS_PORT/REDIS_PASSWORD 推导后传给子进程；
 # 在这里写死会盖掉推导结果，换 Redis 地址时就会连不上。
 
-# 5010 proxy_pool API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
-# 5051 是看板内部 API，6379 是内置 Redis，都只监听回环，不对外暴露
+# 5010 proxy_pool 原生 API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
 EXPOSE 5010 5050 8080 1080
 
 # HEALTHCHECK 必须用 shell 形式（脚本内部有条件判断）

@@ -67,7 +67,8 @@ class TestProxySerialization:
         p = Proxy("1.2.3.4:8080")
         d = p.to_dict
         expected_keys = {"proxy", "https", "fail_count", "region", "anonymous",
-                         "source", "check_count", "last_status", "last_time"}
+                         "source", "check_count", "last_status", "last_time",
+                         "latency"}
         assert set(d.keys()) == expected_keys
 
     def test_to_dict_values(self):

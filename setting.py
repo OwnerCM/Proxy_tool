@@ -66,6 +66,11 @@ MAX_FAIL_COUNT = 0
 # proxyCheck时代理数量少于POOL_SIZE_MIN触发抓取
 POOL_SIZE_MIN = 20
 
+# 校验线程数。合并了 GitHub 代理列表源之后待校验量比原来大得多,
+# 若采集轮次跑不完(日志里 ProxyCheck 迟迟不 complete), 调大这个值,
+# 或调小上面的 VERIFY_TIMEOUT / fetcher/sources/github_lists.py 的 GITHUB_FETCH_LIMIT
+PROXY_CHECK_THREADS = 20
+
 # ############# proxy attributes #################
 # 是否启用代理地域属性
 PROXY_REGION = True
