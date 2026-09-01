@@ -54,14 +54,17 @@ LABEL org.opencontainers.image.title="proxy-tool" \
       org.opencontainers.image.description="代理池 + 可视化看板 + 轮换代理网关，单容器多架构镜像（支持 arm64）" \
       org.opencontainers.image.licenses="MIT"
 
-# tini -> PID 1，负责信号转发与回收孤儿进程
-# curl -> HEALTHCHECK
+# tini   -> PID 1，负责信号转发与回收孤儿进程
+# curl   -> 手工排查用（健康检查已改为 supervisor.py --healthcheck，不依赖它）
+# procps -> 提供 ps/top。基础镜像没有它，而这个容器里跑着好几个进程，
+#           没有 ps 就只能看 docker stats 的聚合值，定位不到是哪个进程在吃 CPU
 # libxml2/libxslt1.1 -> 仅在 lxml 退化为源码编译时才需要的动态库（很小，作为兜底）
 # hadolint ignore=DL3008
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tini \
         curl \
+        procps \
         tzdata \
         libxml2 \
         libxslt1.1 \
@@ -135,8 +138,10 @@ ENV REDIS_HOST=redis \
 # 5010 proxy_pool 原生 API / 5050 看板 / 8080 网关(HTTP) / 1080 网关(SOCKS5)
 EXPOSE 5010 5050 8080 1080
 
-# 健康检查复用 supervisor 的 SVC_* 判定，只探测被启用的服务
-HEALTHCHECK --interval=30s --timeout=15s --start-period=60s --retries=3 \
+# 健康检查复用 supervisor 的 SVC_* 判定，只探测被启用的服务。
+# interval 用 60s 而非 30s：探 /api/stats 会触发展示层重建全量快照，
+# 频率过高等于自己给自己加负载。
+HEALTHCHECK --interval=60s --timeout=15s --start-period=60s --retries=3 \
     CMD ["python", "/opt/proxy-tool/supervisor.py", "--healthcheck"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

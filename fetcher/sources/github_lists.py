@@ -24,12 +24,12 @@ logger = LogHandler("fetcher")
 # 所以每个源每轮只随机取 GITHUB_FETCH_LIMIT 条。随机采样的好处是多轮下来能把
 # 整个列表都覆盖到，而不是每次都盯着开头那几条。
 #
-# 粗略的吞吐account：单源 150 条 × 10 个源 = 1500 条/轮，
-# 免费代理里约六成会立刻连接失败、三成会耗到超时，均摊约 3s，
-# 1500 × 3 / 20 线程 ≈ 225s，刚好落在 5 分钟的采集间隔内。
-# 想放大就同时调 GITHUB_FETCH_LIMIT 与 PROXY_CHECK_THREADS，
-# 或把 setting.py 里的 VERIFY_TIMEOUT 从 10 降到 5。
-FETCH_LIMIT = int(os.environ.get("GITHUB_FETCH_LIMIT", "150") or 150)
+# 粗略的吞吐核算：单源 50 条 × 10 个源 = 500 条/轮，每条要一次 HTTP 校验
+# 加一次 HTTPS 的 TLS 握手；免费代理大多连不上，按 VERIFY_TIMEOUT=5 均摊约 3s，
+# 500 × 3 / 5 线程 ≈ 300s，落在 30 分钟的采集间隔内还有很大余量。
+# 想让池子长得更快就调大这个值和 PROXY_CHECK_THREADS、调小 PROXY_FETCH_INTERVAL，
+# 反之继续调小。判断依据看日志里 ProxyCheck 是否每轮都能 complete。
+FETCH_LIMIT = int(os.environ.get("GITHUB_FETCH_LIMIT", "50") or 50)
 
 # 仓库 -> raw 列表 URL。
 # 只收 HTTP/HTTPS 列表：proxy_pool 的校验器用 requests 的 http/https proxies 参数，

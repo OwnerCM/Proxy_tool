@@ -23,7 +23,8 @@ PROXY_POOL_DB             proxy_pool 用的库号，默认 0
 TABLE_NAME                proxy_pool 的 hash 名，默认 use_proxy（与 setting.py 同名配置对应）
 WEB_PORT                  监听端口，默认 5050
 WEB_BIND                  监听地址，默认 0.0.0.0
-SNAPSHOT_TTL              快照缓存秒数，默认 60
+SNAPSHOT_TTL              快照缓存秒数，默认 300。健康检查每分钟会打 /api/stats，
+                          这个值决定了多久重建一次全量快照（hscan + 逐条解析）
 """
 
 import json
@@ -45,7 +46,7 @@ PROXY_POOL_DB = int(os.environ.get("PROXY_POOL_DB", "0") or 0)
 TABLE_NAME = os.environ.get("TABLE_NAME", "use_proxy")
 WEB_PORT = int(os.environ.get("WEB_PORT", "5050") or 5050)
 WEB_BIND = os.environ.get("WEB_BIND", "0.0.0.0")
-SNAPSHOT_TTL = int(os.environ.get("SNAPSHOT_TTL", "60") or 60)
+SNAPSHOT_TTL = int(os.environ.get("SNAPSHOT_TTL", "300") or 300)
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 MAX_LIMIT = 200

@@ -108,29 +108,32 @@ class TestRunScheduler:
     @patch("helper.scheduler.__runProxyFetch")
     @patch("helper.scheduler.ConfigHandler")
     @patch("helper.scheduler.LogHandler")
-    def test_fetch_job_interval_5min(self, mock_log, mock_conf_cls, mock_fetch, mock_sched_cls):
-        """采集任务间隔 5 分钟"""
+    def test_fetch_job_interval_from_config(self, mock_log, mock_conf_cls, mock_fetch, mock_sched_cls):
+        """采集任务间隔取自配置（PROXY_FETCH_INTERVAL），不是写死的值"""
         mock_conf = MagicMock()
         mock_conf.timezone = "Asia/Shanghai"
         mock_conf_cls.return_value = mock_conf
         mock_sched = MagicMock()
         mock_sched_cls.return_value = mock_sched
 
+        mock_conf.proxyFetchInterval = 30
+
         scheduler_mod.runScheduler()
 
         calls = mock_sched.add_job.call_args_list
         first_call = calls[0]
         assert first_call[0][1] == "interval"
-        assert first_call[1]["minutes"] == 5
+        assert first_call[1]["minutes"] == 30
 
     @patch("helper.scheduler.BlockingScheduler")
     @patch("helper.scheduler.__runProxyFetch")
     @patch("helper.scheduler.ConfigHandler")
     @patch("helper.scheduler.LogHandler")
-    def test_check_job_interval_2min(self, mock_log, mock_conf_cls, mock_fetch, mock_sched_cls):
-        """检查任务间隔 2 分钟"""
+    def test_check_job_interval_from_config(self, mock_log, mock_conf_cls, mock_fetch, mock_sched_cls):
+        """复检任务间隔取自配置（PROXY_CHECK_INTERVAL），不是写死的值"""
         mock_conf = MagicMock()
         mock_conf.timezone = "Asia/Shanghai"
+        mock_conf.proxyCheckInterval = 15
         mock_conf_cls.return_value = mock_conf
         mock_sched = MagicMock()
         mock_sched_cls.return_value = mock_sched
@@ -140,4 +143,22 @@ class TestRunScheduler:
         calls = mock_sched.add_job.call_args_list
         second_call = calls[1]
         assert second_call[0][1] == "interval"
-        assert second_call[1]["minutes"] == 2
+        assert second_call[1]["minutes"] == 15
+
+    @patch("helper.scheduler.BlockingScheduler")
+    @patch("helper.scheduler.__runProxyFetch")
+    @patch("helper.scheduler.ConfigHandler")
+    @patch("helper.scheduler.LogHandler")
+    def test_jobs_do_not_pile_up(self, mock_log, mock_conf_cls, mock_fetch, mock_sched_cls):
+        """任务不允许堆叠 —— 上游的 max_instances=10 是 CPU 飙高的主要放大器"""
+        mock_conf = MagicMock()
+        mock_conf.timezone = "Asia/Shanghai"
+        mock_conf_cls.return_value = mock_conf
+        mock_sched = MagicMock()
+        mock_sched_cls.return_value = mock_sched
+
+        scheduler_mod.runScheduler()
+
+        job_defaults = mock_sched.configure.call_args[1]["job_defaults"]
+        assert job_defaults["max_instances"] == 1
+        assert job_defaults["coalesce"] is True

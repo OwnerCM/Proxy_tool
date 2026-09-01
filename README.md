@@ -224,24 +224,62 @@ curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 | `SVC_WEB` | `1` | 展示层 |
 | `SVC_GATEWAY` | `1` | 8080 / 1080 轮换代理 |
 
-### 采集与验证吞吐（重要）
+### CPU 占用与调优
 
-移植进来的 GitHub 列表源加起来有一万多条，而且绝大多数是死的。
-proxy_pool 的调度是**每 5 分钟采集一轮、每 2 分钟全量复检**，
-若不限流，单轮验证要跑一个多小时，远超调度间隔，任务会不断堆叠直到把池子拖死。
+**CPU 几乎全部来自代理校验。** 每校验一个代理要发一次 HTTP 请求（`http://httpbin.org`）
+再发一次 HTTPS 请求（`https://www.qq.com`），后者每次都是一轮 **TLS 握手** —— 这是真实的
+计算开销，不只是等网络。池子里有多少代理、多久校验一次，直接决定 CPU 占用。
 
-所以每个 GitHub 源每轮只随机取 `GITHUB_FETCH_LIMIT` 条（默认 150，10 个源共约 1500 条）。
-随机采样能让多轮下来覆盖整个列表，而不是每次都盯着开头几条。
+本项目把上游那套"追求实时性"的默认值全部调低了。代理池的实时性通常不重要
+（晚几分钟发现一个代理失效没有影响），但每一轮校验都要花 CPU。
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `GITHUB_FETCH_LIMIT` | `150` | 每个 GitHub 源每轮的取样上限，`0` = 不限 |
-| `PROXY_CHECK_THREADS` | `20` | 校验线程数（上游写死 20，本项目改为可配） |
-| `VERIFY_TIMEOUT` | `10` | 单个代理的校验超时（秒），调小能显著提升吞吐 |
+| 变量 | 本项目默认 | 上游 | 作用 |
+| --- | --- | --- | --- |
+| `PROXY_FETCH_INTERVAL` | `30` 分钟 | 5 分钟 | 拉取所有代理源并校验新代理 |
+| `PROXY_CHECK_INTERVAL` | `15` 分钟 | 2 分钟 | 全量重新校验池中已有代理 |
+| `PROXY_CHECK_THREADS` | `5` | 写死 20 | 并发校验数，即同时进行的 TLS 握手数 |
+| `VERIFY_TIMEOUT` | `5` 秒 | 10 秒 | 死代理占用线程的时长 |
+| `GITHUB_FETCH_LIMIT` | `50` | — | 每个 GitHub 源每轮取样上限，`0` = 不限 |
+| `SERVER_WORKERS` | `1` | 写死 4 | API 的 gunicorn worker 数 |
+| `LOG_LEVEL` | `INFO` | 写死 DEBUG | 校验器对每个代理都打日志 |
+| `LOG_TO_FILE` | `false` | 写死 true | 容器里 stdout 已被 docker 收集，再写文件是重复 I/O |
+| `SNAPSHOT_TTL` | `300` 秒 | — | 展示层重建全量快照的间隔 |
+| `GATEWAY_REFRESH` | `120` 秒 | — | 网关刷新上游列表的间隔 |
 
-粗算：1500 条 × 均摊 3s ÷ 20 线程 ≈ 225s，刚好落在 5 分钟的采集间隔内。
-想放大源规模就同时调大前两项，或把 `VERIFY_TIMEOUT` 降到 5。
-日志里 `ProxyCheck` 迟迟不 `complete` 就是没跑完的信号。
+嫌池子长得慢就往回调（比如 `PROXY_FETCH_INTERVAL=10`、`PROXY_CHECK_THREADS=15`），
+在 compose 的 `proxy-tool` 下加 `environment:` 即可。
+
+#### 两处不是"调参"而是修掉的问题
+
+**1. 任务堆叠（影响最大）。** 上游调度器用的是 `coalesce: False` + `max_instances: 10`：
+一轮校验只要没在间隔内跑完，APScheduler 就再起一个实例，最多叠到 10 层，
+而每一层又会开满校验线程 —— 最坏情况几百个线程同时做 TLS 握手。
+这是把上面所有成本乘以 10 的放大器。已改为 `max_instances: 1` + `coalesce: True`：
+跑不完就跳过本轮，跳过时 APScheduler 会打一条 warning，正好是"跟不上"的信号。
+（有一条回归测试专门守着这两个值。）
+
+**2. 每个新代理一次多余的联网请求。** 上游 `PROXY_REGION=True` 的实现是给每个新代理
+发一次 `https://api.ip.sb/geoip/` 请求，只为拿一个国家代码。而容器里本来就有离线库
+`web/data/ipdb.bin`，展示层在 `region` 为空时会用它解析，粒度完全相同（都只到国家）。
+已默认关闭。顺带修了上游的一个 bug：`proxyRegion` 用 `bool(os.getenv(...))` 判断，
+而 `bool("0")` 是 `True`，导致这个开关**用环境变量根本关不掉**。
+
+另外删掉了调度器里声明但无人使用的 `ProcessPoolExecutor(max_workers=5)`。
+
+#### 怎么看是谁在吃 CPU
+
+```bash
+docker stats --no-stream proxy-tool proxy-redis
+
+# 容器内按 CPU 排序看各进程（镜像已装 procps）
+docker compose exec proxy-tool ps -eo pid,pcpu,pmem,rss,comm --sort=-pcpu | head
+
+# 校验轮次是否跑得完：每轮都该出现 complete，且不该有 skipped 警告
+docker compose logs --since 30m proxy-tool | grep -E "ProxyCheck.*(start|complete)|max_instances|skipped"
+```
+
+日志里出现 `Execution of job ... skipped: maximum number of running instances reached`
+说明这一轮没跑完 —— 把间隔调大或线程数调小，或降低 `GITHUB_FETCH_LIMIT`。
 
 ### Redis
 

@@ -31,7 +31,7 @@ GATEWAY_SOCKS_PORT      SOCKS5 监听端口，默认 1080；设为 0 关闭
 GATEWAY_BIND            监听地址，默认 0.0.0.0
 GATEWAY_USER            客户端鉴权用户名（留空 = 不鉴权）
 GATEWAY_PASS            客户端鉴权密码
-GATEWAY_REFRESH         上游列表刷新间隔秒数，默认 60
+GATEWAY_REFRESH         上游列表刷新间隔秒数，默认 120
 GATEWAY_TOP_N           候选池保留的最快上游数量，默认 200
 GATEWAY_POOL_SCAN       每轮从 Redis 扫描的成员上限，默认 1000
 GATEWAY_MAX_RETRIES     单次请求最多尝试几个上游，默认 3
@@ -88,7 +88,7 @@ SOCKS_PORT = _env_int("GATEWAY_SOCKS_PORT", 1080)
 BIND = os.environ.get("GATEWAY_BIND", "0.0.0.0")
 AUTH_USER = os.environ.get("GATEWAY_USER", "")
 AUTH_PASS = os.environ.get("GATEWAY_PASS", "")
-REFRESH = max(10, _env_int("GATEWAY_REFRESH", 60))
+REFRESH = max(10, _env_int("GATEWAY_REFRESH", 120))
 TOP_N = max(1, _env_int("GATEWAY_TOP_N", 200))
 POOL_SCAN = max(1, _env_int("GATEWAY_POOL_SCAN", 1000))
 MAX_RETRIES = max(1, _env_int("GATEWAY_MAX_RETRIES", 3))

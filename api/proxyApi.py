@@ -127,7 +127,10 @@ def runFlask():
 
         _options = {
             'bind': '%s:%s' % (conf.serverHost, conf.serverPort),
-            'workers': 4,
+            # 上游写死 4。这个 API 只供人工查看和外部调用——展示层和网关都是
+            # 直读 Redis 的，不经过它，所以默认降到 1 个 worker（见 SERVER_WORKERS）。
+            # 每个 worker 都是一个常驻 Python 解释器，省下来的是实打实的内存和调度开销。
+            'workers': conf.serverWorkers,
             'accesslog': '-',  # log to stdout
             'access_log_format': '%(h)s %(l)s %(t)s "%(r)s" %(s)s "%(a)s"'
         }

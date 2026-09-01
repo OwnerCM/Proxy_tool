@@ -14,7 +14,6 @@
 __author__ = 'JHao'
 
 from apscheduler.schedulers.blocking import BlockingScheduler
-from apscheduler.executors.pool import ProcessPoolExecutor
 
 from util.six import Queue
 from helper.fetch import Fetcher
@@ -51,16 +50,25 @@ def runScheduler():
     scheduler_log = LogHandler("scheduler")
     scheduler = BlockingScheduler(logger=scheduler_log, timezone=timezone)
 
-    scheduler.add_job(__runProxyFetch, 'interval', minutes=5, id="proxy_fetch", name="proxy采集")
-    scheduler.add_job(__runProxyCheck, 'interval', minutes=2, id="proxy_check", name="proxy检查")
-    executors = {
-        'default': {'type': 'threadpool', 'max_workers': 20},
-        'processpool': ProcessPoolExecutor(max_workers=5)
-    }
+    conf = ConfigHandler()
+    scheduler.add_job(__runProxyFetch, 'interval', minutes=conf.proxyFetchInterval,
+                      id="proxy_fetch", name="proxy采集")
+    scheduler.add_job(__runProxyCheck, 'interval', minutes=conf.proxyCheckInterval,
+                      id="proxy_check", name="proxy检查")
+
+    # 只有两个 job，20 个执行线程没有意义（上游写死 20）
+    executors = {'default': {'type': 'threadpool', 'max_workers': 2}}
+    # 上游这里是 coalesce=False + max_instances=10，是本系统 CPU 飙高的主要放大器：
+    # 一轮校验只要没在间隔内跑完，APScheduler 就再起一个实例，最多叠到 10 层，
+    # 而每一层又会开 PROXY_CHECK_THREADS 个线程去做 TLS 握手。
+    # 改成 max_instances=1 后跑不完就跳过本轮；coalesce=True 让积压的多次触发
+    # 合并为一次。跳过时 APScheduler 会打一条 warning，正好是"跟不上"的信号。
     job_defaults = {
-        'coalesce': False,
-        'max_instances': 10
+        'coalesce': True,
+        'max_instances': 1,
     }
+    # 上游还声明了 processpool 执行器（ProcessPoolExecutor(max_workers=5)），
+    # 但没有任何 job 指定用它 —— 死配置，已删除。
 
     scheduler.configure(executors=executors, job_defaults=job_defaults, timezone=timezone)
 
