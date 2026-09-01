@@ -19,6 +19,15 @@ services:
     image: redis:7-alpine
     container_name: proxy-redis
     restart: unless-stopped
+    # 代理池是可再生数据，不需要持久化（关掉 RDB/AOF 省掉 fork 时的内存翻倍与磁盘 I/O）；
+    # maxmemory 给 Redis 一个内存上界，避免它成为长期运行后的内存增长点。
+    #
+    # 用 volatile-lru 而不是 allkeys-lru 是关键：只有带 TTL 的 key 会被淘汰，
+    # 而带 TTL 的只有 GeoIP 查询缓存（geo:*，7 天），代理数据用的是不带 TTL 的
+    # hash，所以到上限时被淘汰的一定是可重建的缓存，代理池本身永远不会被动过。
+    command: >
+      redis-server --save '' --appendonly no
+      --maxmemory 256mb --maxmemory-policy volatile-lru
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 10s

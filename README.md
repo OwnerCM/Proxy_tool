@@ -226,9 +226,10 @@ curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 
 ### CPU 占用与调优
 
-**CPU 几乎全部来自代理校验。** 每校验一个代理要发一次 HTTP 请求（`http://httpbin.org`）
-再发一次 HTTPS 请求（`https://www.qq.com`），后者每次都是一轮 **TLS 握手** —— 这是真实的
-计算开销，不只是等网络。池子里有多少代理、多久校验一次，直接决定 CPU 占用。
+**CPU 几乎全部来自代理校验。** 每校验一个代理先发一次 HTTP 请求（`HTTP_URL`），
+只有通过了才再发一次 HTTPS 请求（`HTTPS_URL`）判断是否支持 HTTPS —— 后者是一轮
+**TLS 握手**，真实的计算开销，不只是等网络。由于绝大多数抓来的代理连第一步都过不了，
+实际上只有少数代理会走到 TLS 那步。池子里有多少代理、多久校验一次，直接决定 CPU 占用。
 
 本项目把上游那套"追求实时性"的默认值全部调低了。代理池的实时性通常不重要
 （晚几分钟发现一个代理失效没有影响），但每一轮校验都要花 CPU。
@@ -238,6 +239,8 @@ curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 | `PROXY_FETCH_INTERVAL` | `30` 分钟 | 5 分钟 | 拉取所有代理源并校验新代理 |
 | `PROXY_CHECK_INTERVAL` | `15` 分钟 | 2 分钟 | 全量重新校验池中已有代理 |
 | `PROXY_CHECK_THREADS` | `5` | 写死 20 | 并发校验数，即同时进行的 TLS 握手数 |
+| `PROXY_FETCH_THREADS` | `5` | 无上限 | 并发采集数，见下方问题 3 |
+| `PROXY_CHECK_HTTPS` | `true` | 写死开启 | 是否额外判断代理支持 HTTPS，关掉可省掉全部 TLS 握手 |
 | `VERIFY_TIMEOUT` | `5` 秒 | 10 秒 | 死代理占用线程的时长 |
 | `GITHUB_FETCH_LIMIT` | `50` | — | 每个 GitHub 源每轮取样上限，`0` = 不限 |
 | `SERVER_WORKERS` | `1` | 写死 4 | API 的 gunicorn worker 数 |
@@ -249,7 +252,10 @@ curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 嫌池子长得慢就往回调（比如 `PROXY_FETCH_INTERVAL=10`、`PROXY_CHECK_THREADS=15`），
 在 compose 的 `proxy-tool` 下加 `environment:` 即可。
 
-#### 两处不是"调参"而是修掉的问题
+关掉 `PROXY_CHECK_HTTPS` 能省掉校验里唯一的 TLS 握手，代价是 `/get/?type=https`
+和看板的协议列会失效（所有代理都被记为不支持 HTTPS），所以默认保持开启。
+
+#### 三处不是"调参"而是修掉的问题
 
 **1. 任务堆叠（影响最大）。** 上游调度器用的是 `coalesce: False` + `max_instances: 10`：
 一轮校验只要没在间隔内跑完，APScheduler 就再起一个实例，最多叠到 10 层，
@@ -264,15 +270,53 @@ curl -x socks5h://proxy-tool:1080 https://httpbin.org/ip
 已默认关闭。顺带修了上游的一个 bug：`proxyRegion` 用 `bool(os.getenv(...))` 判断，
 而 `bool("0")` 是 `True`，导致这个开关**用环境变量根本关不掉**。
 
+**3. 采集器并发没有上限（CPU 尖刺的来源）。** 上游给每个采集源起一个线程，然后
+**全部同时 start**，没有任何上限。本项目有 24 个采集源，于是每 `PROXY_FETCH_INTERVAL`
+分钟就出现一次 24 路并发 HTTP 下载 + lxml 解析的爆发 —— 这正是监控上看到的周期性尖刺。
+`PROXY_CHECK_THREADS` 管不到这里，它只限制校验器。已改为固定数量的 worker 从队列取任务
+（`PROXY_FETCH_THREADS`，默认 5），瞬时并发被压平，线程数也从 24 降到 5。
+
 另外删掉了调度器里声明但无人使用的 `ProcessPoolExecutor(max_workers=5)`。
 
-#### 怎么看是谁在吃 CPU
+### 内存占用
+
+改造中最大的一处内存问题在离线 GeoIP 库的**内存表示**上，与磁盘占用无关：
+
+`web/data/ipdb.bin` 是 3.4MB / 355,814 条 IP 段记录。上游的加载方式是把它整个展开成
+Python 元组列表 `[(start, end, country), ...]` —— 每条约 163 字节（元组 64 + 两个
+int 48 + 字符串 51），再加上排序产生的临时对象和 35 万次小对象分配造成的堆碎片，
+**实测让进程 RSS 增加 194MB**，一个 3.4MB 的文件在内存里放大了 21 倍。
+
+现在改成原样持有二进制载荷、直接在字节上二分查找（每条固定 10 字节，文件本身有序，
+所以不需要建任何 Python 对象），**同一进程的增量从 194MB 降到 3MB**。
+查询结果与旧实现逐条比对一致（6210 个样本，含 800 个区间的边界值与越界值）。
+顺带去掉了查询路径上的锁 —— `bytes` 不可变不需要锁，而上游持锁会把展示层
+"为快照里每个代理解析国家"这件事整个串行化。
+
+另外两项：
+
+- **`MALLOC_ARENA_MAX=2`**（镜像 ENV）。glibc 默认给每个进程开到 8×CPU核数 个 malloc
+  arena，每个都有独立空闲链表，多线程程序会因此虚增几十 MB RSS —— 内存并没真的在用，
+  只是没还给系统。对这种线程不多、以网络 I/O 为主的服务，压到 2 个没有实质影响。
+- **Redis 加 `--maxmemory 256mb --maxmemory-policy volatile-lru`**（compose）。
+  用 `volatile-lru` 而不是 `allkeys-lru` 是关键：只有带 TTL 的 key 会被淘汰，而带 TTL 的
+  只有 GeoIP 查询缓存（`geo:*`，7 天），代理数据用的是不带 TTL 的 hash。
+  所以到上限时被淘汰的一定是可重建的缓存，**代理池本身永远不会被动**。
+
+已知项（未改）：全量复检时会把整池代理一次性读成对象放进队列，内存尖峰与池子大小成正比，
+约 1.4KB/代理（几千个代理只有几 MB，两万个才 27MB）。相比上面那 194MB 不是一个量级，
+池子做到很大时才需要改成流式。
+
+#### 怎么看是谁在吃 CPU / 内存
 
 ```bash
 docker stats --no-stream proxy-tool proxy-redis
 
 # 容器内按 CPU 排序看各进程（镜像已装 procps）
 docker compose exec proxy-tool ps -eo pid,pcpu,pmem,rss,comm --sort=-pcpu | head
+
+# 按内存排序
+docker compose exec proxy-tool ps -eo pid,pcpu,pmem,rss,comm --sort=-rss | head
 
 # 校验轮次是否跑得完：每轮都该出现 complete，且不该有 skipped 警告
 docker compose logs --since 30m proxy-tool | grep -E "ProxyCheck.*(start|complete)|max_instances|skipped"

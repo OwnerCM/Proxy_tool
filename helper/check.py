@@ -46,7 +46,12 @@ class DoValidator(object):
         start = time()
         http_r = cls.httpValidator(proxy)
         latency = int((time() - start) * 1000)
-        https_r = False if not http_r else cls.httpsValidator(proxy)
+        # 短路: 只有通过 HTTP 校验的代理才值得再做一次 TLS 握手。
+        # PROXY_CHECK_HTTPS 可以把这步整个关掉(校验里唯一的 TLS 开销)。
+        if not http_r or not cls.conf.proxyCheckHttps:
+            https_r = False
+        else:
+            https_r = cls.httpsValidator(proxy)
 
         proxy.check_count += 1
         proxy.last_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

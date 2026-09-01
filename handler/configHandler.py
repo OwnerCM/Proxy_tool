@@ -79,6 +79,18 @@ class ConfigHandler(withMetaclass(Singleton)):
                              getattr(setting, "PROXY_CHECK_THREADS", 5)))
 
     @LazyProperty
+    def proxyCheckHttps(self):
+        raw = os.getenv("PROXY_CHECK_HTTPS")
+        if raw is None:
+            return bool(getattr(setting, "PROXY_CHECK_HTTPS", True))
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+    @LazyProperty
+    def proxyFetchThreads(self):
+        return int(os.getenv("PROXY_FETCH_THREADS",
+                             getattr(setting, "PROXY_FETCH_THREADS", 5)))
+
+    @LazyProperty
     def proxyFetchInterval(self):
         return int(os.getenv("PROXY_FETCH_INTERVAL",
                              getattr(setting, "PROXY_FETCH_INTERVAL", 30)))

@@ -79,6 +79,19 @@ POOL_SIZE_MIN = 20
 # 校验线程数(上游写死 20)。同时进行的 TLS 握手数量, 是 CPU 的主要来源
 PROXY_CHECK_THREADS = 5
 
+# 是否额外判断代理支持 HTTPS。这是校验流程里唯一的 TLS 握手, 也就是单个代理
+# 校验中最贵的一步(注意它是短路的: 只有通过了 HTTP 校验的代理才会走到这里,
+# 所以实际执行次数远少于代理总数)。
+# 关掉能把这部分 CPU 全部省掉, 代价是 /get/?type=https 和看板的协议列会失效
+# (所有代理都被记为不支持 HTTPS), 所以默认保持开启
+PROXY_CHECK_HTTPS = True
+
+# 采集线程数。上游把**所有**采集源(本项目 24 个)一次性全部 start, 没有上限,
+# 于是每 PROXY_FETCH_INTERVAL 分钟就出现一次 24 路并发 HTTP + lxml 解析的爆发
+# ——这是 CPU 尖刺的主要来源(PROXY_CHECK_THREADS 只管校验器, 管不到采集器)。
+# 调小只是让采集从"一次全开"变成分批, 一轮总耗时略长, 但曲线平稳得多
+PROXY_FETCH_THREADS = 5
+
 # 采集间隔(分钟): 拉取所有代理源并校验新代理。上游默认 5
 PROXY_FETCH_INTERVAL = 30
 

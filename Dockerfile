@@ -75,10 +75,15 @@ RUN ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime && echo "$TZ" > /etc/timezo
 
 COPY --from=builder /opt/venv /opt/venv
 
+# MALLOC_ARENA_MAX：glibc 默认给每个进程开到 8×CPU核数 个 malloc arena，每个 arena
+# 都有独立的空闲链表，多线程程序（这里每个进程都有若干工作线程）会因此虚增几十 MB
+# RSS —— 内存并没有真的在用，只是没还给系统。压到 2 个对吞吐没有实质影响，
+# 这类线程数不多、以网络 I/O 为主的服务尤其如此。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
-    APP_DIR=/app
+    APP_DIR=/app \
+    MALLOC_ARENA_MAX=2
 
 # ── 代码就位：两份源码同放 /app ──
 WORKDIR /app

@@ -12,12 +12,14 @@
 """
 __author__ = 'JHao'
 
+import os
 import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 from datetime import datetime
 
 from helper.proxy import Proxy
 from helper.check import DoValidator, _ThreadChecker
+from helper.validator import ProxyValidator
 
 
 class TestDoValidator:
@@ -274,3 +276,68 @@ class TestThreadCheckerIfUse:
         checker._ThreadChecker__ifUse(proxy)
         mock_ph.put.assert_called_once_with(proxy)
         mock_ph.delete.assert_not_called()
+
+
+class TestProxyCheckHttpsSwitch:
+    """PROXY_CHECK_HTTPS：校验流程里唯一的 TLS 握手，可整体关掉以省 CPU"""
+
+    @staticmethod
+    def _run(check_https, https_validator_result=True):
+        """跑一次 validator，返回 (proxy 结果, https 校验器是否被调用过)"""
+        https_fn = MagicMock(return_value=https_validator_result)
+        mock_conf = MagicMock()
+        mock_conf.proxyRegion = False
+        mock_conf.proxyCheckHttps = check_https
+
+        proxy = Proxy("1.2.3.4:8080", source="test")
+        with patch.object(ProxyValidator, "http_validator", [MagicMock(return_value=True)]), \
+                patch.object(ProxyValidator, "https_validator", [https_fn]), \
+                patch.object(DoValidator, "conf", mock_conf):
+            result = DoValidator.validator(proxy, "use")
+        return result, https_fn.called
+
+    def test_enabled_runs_tls_check(self):
+        """开启时照常做 HTTPS 校验"""
+        result, called = self._run(check_https=True)
+        assert called is True
+        assert result.https is True
+
+    def test_disabled_skips_tls_check(self):
+        """关闭时完全不调用 HTTPS 校验器 —— 这才是省 CPU 的地方"""
+        result, called = self._run(check_https=False)
+        assert called is False
+        assert result.https is False
+
+    def test_disabled_does_not_affect_availability(self):
+        """关掉 HTTPS 判断不能让代理变成"不可用"，只影响 https 字段"""
+        result, _ = self._run(check_https=False)
+        assert result.last_status is True
+        assert result.fail_count == 0
+
+    @staticmethod
+    def _read_conf():
+        """ConfigHandler 是单例 + LazyProperty 会把值缓存成实例属性，
+        要重新读一次 env 必须先把缓存的属性删掉"""
+        from handler.configHandler import ConfigHandler
+        conf = ConfigHandler()
+        conf.__dict__.pop("proxyCheckHttps", None)
+        return conf.proxyCheckHttps
+
+    def test_default_keeps_current_behaviour(self):
+        """默认值必须是开启，避免静默改变既有行为"""
+        os.environ.pop("PROXY_CHECK_HTTPS", None)
+        assert self._read_conf() is True
+
+    def test_env_can_turn_it_off(self):
+        """必须能用环境变量关掉（上游 bool(os.getenv()) 那类写法是关不掉的）"""
+        try:
+            for raw in ("0", "false", "False", "no", "off", ""):
+                os.environ["PROXY_CHECK_HTTPS"] = raw
+                assert self._read_conf() is False, raw
+            for raw in ("1", "true", "True", "yes", "on"):
+                os.environ["PROXY_CHECK_HTTPS"] = raw
+                assert self._read_conf() is True, raw
+        finally:
+            os.environ.pop("PROXY_CHECK_HTTPS", None)
+            from handler.configHandler import ConfigHandler
+            ConfigHandler().__dict__.pop("proxyCheckHttps", None)

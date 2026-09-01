@@ -88,11 +88,22 @@ _COUNTRY_REVERSE.update({
 
 # ═══════════ Local Binary IP Database (offline, ~1μs lookup) ═══════════
 
-_local_db = {"entries": [], "loaded": False, "lock": threading.Lock()}
+# 每条记录固定 10 字节: start uint32(LE) + end uint32(LE) + 2 字节国家码
+_ENTRY_SIZE = 10
+_local_db = {"buf": b"", "count": 0, "loaded": False, "lock": threading.Lock()}
 
 
 def _load_local_db(path=None):
-    """Load binary IP range database into memory. 3.5MB for 355K entries."""
+    """把离线 IP 库读进内存供二分查找, 原样保留二进制载荷、不解析成 Python 对象。
+
+    上游的做法是整个展开成 355K 个元组 (start, end, country), 实测让进程 RSS
+    增加 194MB —— 每条约 163 字节(元组 64 + 两个 int 48 + 字符串 51), 再加上
+    排序的临时对象和 35 万次小对象分配造成的堆碎片, 一个 3.4MB 的文件在内存里
+    放大了 21 倍。改成持有 bytes 后内存就等于文件本身的 3.4MB。
+
+    前提是记录按 start 升序且步长固定: 写库的 _update_local_db() 会先排序,
+    随仓库分发的 ipdb.bin 也已验证有序(0 处逆序)。
+    """
     path = path or LOCAL_DB_PATH
     with _local_db["lock"]:
         if _local_db["loaded"]:
@@ -102,17 +113,10 @@ def _load_local_db(path=None):
         try:
             with open(path, "rb") as f:
                 count = struct.unpack("<I", f.read(4))[0]
-                entries = []
-                for _ in range(count):
-                    data = f.read(10)
-                    if len(data) < 10:
-                        break
-                    start_int = struct.unpack("<I", data[0:4])[0]
-                    end_int = struct.unpack("<I", data[4:8])[0]
-                    country = data[8:10].decode("ascii").rstrip("\x00")
-                    entries.append((start_int, end_int, country))
-            entries.sort(key=lambda x: x[0])
-            _local_db["entries"] = entries
+                payload = f.read(count * _ENTRY_SIZE)
+            # 文件被截断时按实际长度取, 避免二分读出界
+            _local_db["buf"] = payload
+            _local_db["count"] = min(count, len(payload) // _ENTRY_SIZE)
             _local_db["loaded"] = True
             return True
         except Exception:
@@ -123,24 +127,28 @@ def _local_lookup(ip_str):
     """Binary search for country code. Returns 'ZZ' if not found."""
     if not _local_db["loaded"]:
         _load_local_db()
-    with _local_db["lock"]:
-        entries = _local_db["entries"]
-        if not entries:
-            return "ZZ"
-        try:
-            target = struct.unpack("!I", socket.inet_aton(ip_str))[0]
-        except Exception:
-            return "ZZ"
-        lo, hi = 0, len(entries) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            s, e, c = entries[mid]
-            if target < s:
-                hi = mid - 1
-            elif target > e:
-                lo = mid + 1
-            else:
-                return c
+    # 不加锁: buf 是 bytes(不可变), 且 loaded 是最后才置位的, 读到 True 就说明
+    # buf/count 已就绪。上游在查询时持锁, 等于把所有线程的查询串行化 ——
+    # 展示层要为快照里每个代理解析国家, 那个锁会直接成为瓶颈。
+    buf = _local_db["buf"]
+    count = _local_db["count"]
+    if not count:
+        return "ZZ"
+    try:
+        target = struct.unpack("!I", socket.inet_aton(ip_str))[0]
+    except Exception:
+        return "ZZ"
+    lo, hi = 0, count - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        offset = mid * _ENTRY_SIZE
+        start_int, end_int = struct.unpack_from("<II", buf, offset)
+        if target < start_int:
+            hi = mid - 1
+        elif target > end_int:
+            lo = mid + 1
+        else:
+            return buf[offset + 8:offset + 10].decode("ascii", "replace").rstrip("\x00")
     return "ZZ"
 
 
@@ -187,9 +195,14 @@ def _update_local_db():
                 f.write(struct.pack("<II", start_int, end_int))
                 f.write(country_bytes)
         os.rename(tmp_path, LOCAL_DB_PATH)
+        # 让下一次查询按新表示从文件重新加载, 而不是把刚才那份元组列表塞进缓存
+        # (那正是内存放大的来源)。顺手把临时的 entries 释放掉。
         with _local_db["lock"]:
-            _local_db["entries"] = entries
-            _local_db["loaded"] = True
+            _local_db["loaded"] = False
+            _local_db["buf"] = b""
+            _local_db["count"] = 0
+        del entries
+        _load_local_db()
         return True
     except Exception:
         return False

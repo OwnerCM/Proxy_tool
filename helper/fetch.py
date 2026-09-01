@@ -16,7 +16,8 @@ __author__ = 'JHao'
 import os
 import sys
 import importlib
-from threading import Thread
+from queue import Queue, Empty
+from threading import Thread, Lock
 
 from helper.proxy import Proxy
 from helper.check import DoValidator
@@ -92,25 +93,44 @@ def _discover_fetchers(exclude_list):
 
 
 class _ThreadFetcher(Thread):
+    """从队列里逐个取采集源来跑, 直到队列取空。
 
-    def __init__(self, fetcher_class, proxy_dict):
+    上游是"一个采集源一个线程, 然后全部同时 start", 24 个源就意味着每
+    PROXY_FETCH_INTERVAL 分钟出现一次 24 路并发 HTTP 下载 + lxml 解析的爆发,
+    这是 CPU 尖刺的主要来源。改成固定数量的 worker 从队列取任务后, 瞬时并发被
+    压到 PROXY_FETCH_THREADS, 线程数也从 24 降到 5(顺带省掉 19 个线程栈)。
+    一轮总耗时会略长, 但采集本来就不需要抢时间。
+    """
+
+    def __init__(self, task_queue, proxy_dict, dict_lock):
         Thread.__init__(self)
-        self.fetcher_class = fetcher_class
+        self.task_queue = task_queue
         self.proxy_dict = proxy_dict
+        self.dict_lock = dict_lock
         self.log = LogHandler("fetcher")
 
     def run(self):
-        fetcher_name = self.fetcher_class.name
+        while True:
+            try:
+                fetcher_class = self.task_queue.get_nowait()
+            except Empty:
+                return
+            self.__fetch_one(fetcher_class)
+
+    def __fetch_one(self, fetcher_class):
+        fetcher_name = fetcher_class.name
         self.log.info("ProxyFetch - {func}: start".format(func=fetcher_name))
         try:
-            for proxy in self.fetcher_class().fetch():
+            for proxy in fetcher_class().fetch():
                 self.log.info('ProxyFetch - %s: %s ok' % (fetcher_name, proxy.ljust(23)))
                 proxy = proxy.strip()
-                if proxy in self.proxy_dict:
-                    self.proxy_dict[proxy].add_source(fetcher_name)
-                else:
-                    self.proxy_dict[proxy] = Proxy(
-                        proxy, source=fetcher_name)
+                # "先判断再写入"在多线程下是竞态(上游同样有, 后果只是丢掉一次来源
+                # 标注), 这里加锁消掉它 —— 锁的粒度极小, 无实际竞争开销
+                with self.dict_lock:
+                    if proxy in self.proxy_dict:
+                        self.proxy_dict[proxy].add_source(fetcher_name)
+                    else:
+                        self.proxy_dict[proxy] = Proxy(proxy, source=fetcher_name)
         except Exception as e:
             self.log.error("ProxyFetch - {func}: error".format(func=fetcher_name))
             self.log.error(str(e))
@@ -129,6 +149,7 @@ class Fetcher(object):
         :return:
         """
         proxy_dict = dict()
+        dict_lock = Lock()
         thread_list = list()
         self.log.info("ProxyFetch : start")
 
@@ -136,8 +157,17 @@ class Fetcher(object):
         fetcher_classes = _discover_fetchers(exclude_list)
         self.log.info("ProxyFetch : active fetchers [%s]" % ", ".join(c.name for c in fetcher_classes))
 
+        task_queue = Queue()
         for fetcher_class in fetcher_classes:
-            thread_list.append(_ThreadFetcher(fetcher_class, proxy_dict))
+            task_queue.put(fetcher_class)
+
+        # worker 数不超过采集源数, 避免起一堆立刻退出的空线程
+        worker_count = max(1, min(self.conf.proxyFetchThreads, len(fetcher_classes)))
+        self.log.info("ProxyFetch : %s fetchers with %s threads"
+                      % (len(fetcher_classes), worker_count))
+
+        for _ in range(worker_count):
+            thread_list.append(_ThreadFetcher(task_queue, proxy_dict, dict_lock))
 
         for thread in thread_list:
             thread.setDaemon(True)

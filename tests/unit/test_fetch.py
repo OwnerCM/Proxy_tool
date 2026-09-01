@@ -15,6 +15,8 @@ __author__ = 'JHao'
 import os
 import sys
 import pytest
+from queue import Queue
+from threading import Lock
 from unittest.mock import patch, MagicMock
 
 import helper.fetch as fetch_mod
@@ -113,6 +115,14 @@ class TestDiscoverFetchers:
         assert "fetcher.sources.deleted_module" not in fetch_mod._module_cache
 
 
+def _run_worker(fetcher_classes, proxy_dict):
+    """把若干采集源塞进队列, 用单个 worker 同步跑完"""
+    task_queue = Queue()
+    for cls in fetcher_classes:
+        task_queue.put(cls)
+    _ThreadFetcher(task_queue, proxy_dict, Lock()).run()
+
+
 class TestThreadFetcher:
 
     def test_collects_proxies(self):
@@ -122,8 +132,7 @@ class TestThreadFetcher:
         mock_cls.return_value.fetch.return_value = ["1.2.3.4:8080", "5.6.7.8:443"]
 
         proxy_dict = {}
-        thread = _ThreadFetcher(mock_cls, proxy_dict)
-        thread.run()
+        _run_worker([mock_cls], proxy_dict)
 
         assert "1.2.3.4:8080" in proxy_dict
         assert "5.6.7.8:443" in proxy_dict
@@ -136,9 +145,76 @@ class TestThreadFetcher:
         mock_cls.return_value.fetch.return_value = ["1.2.3.4:8080", "1.2.3.4:8080"]
 
         proxy_dict = {}
-        thread = _ThreadFetcher(mock_cls, proxy_dict)
-        thread.run()
+        _run_worker([mock_cls], proxy_dict)
 
         assert "1.2.3.4:8080" in proxy_dict
         # source 应该包含两次 "test_fetcher"（add_source 去重，但只出现一次）
         assert "test_fetcher" in proxy_dict["1.2.3.4:8080"].source
+
+    def test_worker_drains_multiple_fetchers(self):
+        """一个 worker 会把队列里的采集源全部取空, 而不是只跑一个"""
+        classes = []
+        for i in range(4):
+            cls = MagicMock()
+            cls.name = "f%s" % i
+            cls.return_value.fetch.return_value = ["1.2.3.%s:8080" % i]
+            classes.append(cls)
+
+        proxy_dict = {}
+        _run_worker(classes, proxy_dict)
+
+        assert len(proxy_dict) == 4
+
+    def test_one_fetcher_error_does_not_stop_the_rest(self):
+        """某个源抛异常时, worker 继续处理队列里剩下的源"""
+        bad = MagicMock()
+        bad.name = "bad"
+        bad.return_value.fetch.side_effect = RuntimeError("boom")
+        good = MagicMock()
+        good.name = "good"
+        good.return_value.fetch.return_value = ["9.9.9.9:8080"]
+
+        proxy_dict = {}
+        _run_worker([bad, good], proxy_dict)
+
+        assert "9.9.9.9:8080" in proxy_dict
+
+
+class TestFetcherConcurrencyLimit:
+    """采集器并发必须有上限 —— 上游把 24 个源一次性全部 start, 是 CPU 尖刺来源"""
+
+    def _run_with(self, fetch_threads, source_count):
+        classes = []
+        for i in range(source_count):
+            cls = MagicMock()
+            cls.name = "f%s" % i
+            cls.return_value.fetch.return_value = []
+            classes.append(cls)
+
+        started = []
+        real_start = fetch_mod._ThreadFetcher.start
+
+        def spy_start(self):
+            started.append(self)
+            real_start(self)
+
+        fetcher = fetch_mod.Fetcher()
+        with patch.object(fetch_mod, "_discover_fetchers", return_value=classes), \
+                patch.object(fetch_mod._ThreadFetcher, "start", spy_start), \
+                patch.object(type(fetcher.conf), "proxyFetchThreads", fetch_threads), \
+                patch.object(fetch_mod.DoValidator, "preValidator", return_value=True):
+            list(fetcher.run())
+        return len(started)
+
+    def test_thread_count_capped_by_setting(self):
+        """24 个采集源 + 上限 5 -> 只起 5 个线程, 不是 24 个"""
+        assert self._run_with(5, 24) == 5
+
+    def test_thread_count_not_more_than_sources(self):
+        """采集源比上限少时, 不起多余的空线程"""
+        assert self._run_with(5, 2) == 2
+
+    def test_setting_default_is_bounded(self):
+        """默认值必须是个有限的小数字, 不能退化成无上限"""
+        from handler.configHandler import ConfigHandler
+        assert 1 <= ConfigHandler().proxyFetchThreads <= 10
